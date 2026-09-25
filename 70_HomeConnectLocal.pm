@@ -13,8 +13,8 @@
 #  Device capabilities, programs, settings and options are loaded dynamically
 #  from external Home Connect DeviceDescription and FeatureMapping XML files.
 #
-#  Version 1.39, 25.09.2026
-#  $Id: 70_HomeConnectLocal.pm 1.39 2026-09-25 $
+#  Version 1.40, 25.09.2026
+#  $Id: 70_HomeConnectLocal.pm 1.40 2026-09-25 $
 #
 ########################################################################################
 #
@@ -68,6 +68,7 @@
 #  1.37      Central module version added and exposed as MODULE_VERSION Internal
 #  1.38      LastSetList Internal formatted with line breaks for FHEMWEB
 #  1.39      LastSetList uses real newlines; long enum/program entries wrap at commas
+#  1.40      Hob SetList restricted to a conservative whitelist of safe settings
 #
 ########################################################################################
 
@@ -92,7 +93,7 @@ use Encode qw(decode FB_CROAK);
 my %HomeConnectLocal_Private;
 
 # Central module version. Also exposed in each device as MODULE_VERSION.
-my $HomeConnectLocal_VERSION = '1.39';
+my $HomeConnectLocal_VERSION = '1.40';
 
 
 ##############################################
@@ -1731,6 +1732,48 @@ sub HomeConnectLocal_SetList {
         my ($setname) = split(/:/, $_, 2);
         !HomeConnectLocal_SetExcluded($hash, $setname)
     } @list;
+
+    # v1.40: Hob control is intentionally conservative.  Keep the complete
+    # mapping/runtime metadata internally, but expose only explicitly approved
+    # non-cooking settings in FHEMWEB.  The whitelist is built from canonical
+    # set names and converted through the active translation so it also works
+    # with translation=off/DE/EN.  Connection/mapping commands stay available.
+    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob') {
+        my %hob_allowed = map { $_ => 1 } qw(
+            connect
+            disconnect
+            reloadMapping
+        );
+
+        for my $canonical (qw(
+            AlarmClock
+            AllowBackendConnection
+            AllowConsumerInsights
+            AutomaticKeyLock
+            ButtonTones
+            BuzzerBeepLevel
+            ChildLock
+            DisplayBrandLogo
+            DisplayBrightness
+            EndTimerSignalduration
+            EnergyConsumptionIndication
+            HoodAfterRun
+            HoodAutomaticLightOff
+            HoodAutomaticLightOn
+            HoodAutomaticStart
+            Language
+            QuickAdjust
+            RestoreTimer
+        )) {
+            $hob_allowed{$canonical} = 1;
+            $hob_allowed{HomeConnectLocal_SetDisplayToken($hash, 'option', $canonical)} = 1;
+        }
+
+        @list = grep {
+            my ($setname) = split(/:/, $_, 2);
+            $hob_allowed{$setname}
+        } @list;
+    }
 
     my $setlist = join(' ', @list);
 
@@ -7341,3 +7384,4 @@ sub HomeConnectLocal_Attr {
 =cut
 
 1;
+
