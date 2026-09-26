@@ -13,8 +13,8 @@
 #  Device capabilities, programs, settings and options are loaded dynamically
 #  from external Home Connect DeviceDescription and FeatureMapping XML files.
 #
-#  Version 1.40, 25.09.2026
-#  $Id: 70_HomeConnectLocal.pm 1.40 2026-09-25 $
+#  Version 1.41, 26.09.2026
+#  $Id: 70_HomeConnectLocal.pm 1.41 2026-09-26 $
 #
 ########################################################################################
 #
@@ -69,6 +69,7 @@
 #  1.38      LastSetList Internal formatted with line breaks for FHEMWEB
 #  1.39      LastSetList uses real newlines; long enum/program entries wrap at commas
 #  1.40      Hob SetList restricted to a conservative whitelist of safe settings
+#  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
 #
 ########################################################################################
 
@@ -93,7 +94,7 @@ use Encode qw(decode FB_CROAK);
 my %HomeConnectLocal_Private;
 
 # Central module version. Also exposed in each device as MODULE_VERSION.
-my $HomeConnectLocal_VERSION = '1.40';
+my $HomeConnectLocal_VERSION = '1.41';
 
 
 ##############################################
@@ -5071,6 +5072,114 @@ sub HomeConnectLocal_ProcessPayload {
 
 
 ##############################################
+# WebSocket Heartbeat
+##############################################
+
+# Similar to aiohttp's active WebSocket heartbeat: after the WebSocket
+# handshake has completed, send a client PING every 20 seconds.  A PONG must
+# arrive within 10 seconds.  If it does not, close the stale session; the
+# existing HomeConnectLocal_Close() path schedules the normal reconnect.
+#
+# Heartbeat state is private module state so it does not clutter FHEM
+# Internals.  WebSocket control frames are never Home Connect AES encrypted.
+
+sub HomeConnectLocal_HeartbeatStart {
+    my ($hash) = @_;
+    return if !$hash;
+
+    my $name = $hash->{NAME};
+    return if !$name || AttrVal($name, 'disable', 0);
+
+    my $hb = ($HomeConnectLocal_Private{$name}{WS_HEARTBEAT} ||= {});
+    $hb->{pending} = 0;
+    delete $hb->{payload};
+    delete $hb->{sent_at};
+    $hb->{last_pong} = time();
+
+    InternalTimer(
+        time() + 20,
+        'HomeConnectLocal_Heartbeat',
+        $hash,
+        0
+    );
+
+    Log3 $name, 5,
+        "HomeConnectLocal ($name) - WebSocket Heartbeat gestartet (20s/10s).";
+
+    return;
+}
+
+sub HomeConnectLocal_Heartbeat {
+    my ($hash) = @_;
+    return if !$hash;
+
+    my $name = $hash->{NAME};
+    return if !$name || AttrVal($name, 'disable', 0);
+
+    my $s = $hash->{CD};
+    return if !$s || $hash->{WSHandshake};
+
+    my $hb = ($HomeConnectLocal_Private{$name}{WS_HEARTBEAT} ||= {});
+    my $now = time();
+
+    # A PING is outstanding.  The timer is deliberately scheduled for the
+    # 10-second PONG deadline, so reaching this branch means the peer did not
+    # answer in time.
+    if ($hb->{pending}) {
+        my $age = $now - ($hb->{sent_at} // $now);
+        if ($age >= 9) {
+            Log3 $name, 2,
+                "HomeConnectLocal ($name) - WebSocket PONG Timeout; reconnect.";
+            HomeConnectLocal_Close($hash);
+            return;
+        }
+
+        InternalTimer(
+            $now + (10 - $age),
+            'HomeConnectLocal_Heartbeat',
+            $hash,
+            0
+        );
+        return;
+    }
+
+    my $payload = HomeConnectLocal_RandomBytes(4);
+    my $ping = HomeConnectLocal_WSFrame_Control(0x9, $payload);
+
+    if (!defined($ping)) {
+        Log3 $name, 3,
+            "HomeConnectLocal ($name) - WebSocket PING konnte nicht erzeugt werden.";
+        HomeConnectLocal_Close($hash);
+        return;
+    }
+
+    my $written = syswrite($s, $ping);
+    if (!defined($written) || $written != length($ping)) {
+        Log3 $name, 3,
+            "HomeConnectLocal ($name) - WebSocket PING konnte nicht vollständig gesendet werden"
+            . (defined($written) ? " ($written/" . length($ping) . " Bytes)." : ": $!");
+        HomeConnectLocal_Close($hash);
+        return;
+    }
+
+    $hb->{pending} = 1;
+    $hb->{payload} = $payload;
+    $hb->{sent_at} = $now;
+
+    Log3 $name, 5,
+        "HomeConnectLocal ($name) - WebSocket PING gesendet.";
+
+    InternalTimer(
+        $now + 10,
+        'HomeConnectLocal_Heartbeat',
+        $hash,
+        0
+    );
+
+    return;
+}
+
+##############################################
 # Read
 ##############################################
 
@@ -5215,6 +5324,10 @@ sub HomeConnectLocal_Read {
             "HomeConnectLocal ($n) - "
             . "WebSocket Verbindung "
             . "erfolgreich geöffnet.";
+
+        HomeConnectLocal_HeartbeatStart(
+            $hash
+        );
     }
 
 
@@ -5528,11 +5641,20 @@ sub HomeConnectLocal_Read {
                 );
 
 
-            syswrite(
-                $s,
-                $pong
-            ) if defined($pong);
+            my $written =
+                defined($pong)
+                ? syswrite($s, $pong)
+                : undef;
 
+            if (!defined($pong) || !defined($written) || $written != length($pong)) {
+                Log3 $n, 3,
+                    "HomeConnectLocal ($n) - WebSocket PONG konnte nicht vollständig gesendet werden.";
+                HomeConnectLocal_Close($hash);
+                return;
+            }
+
+            Log3 $n, 5,
+                "HomeConnectLocal ($n) - WebSocket PING empfangen, PONG gesendet.";
 
             next;
         }
@@ -5544,6 +5666,30 @@ sub HomeConnectLocal_Read {
         # ==========================================
         #
         if ($op == 0xA) {
+
+            my $hb = ($HomeConnectLocal_Private{$n}{WS_HEARTBEAT} ||= {});
+            my $matched = $hb->{pending}
+                && defined($hb->{payload})
+                && $p eq $hb->{payload};
+
+            $hb->{pending} = 0;
+            delete $hb->{payload};
+            delete $hb->{sent_at};
+            $hb->{last_pong} = time();
+
+            Log3 $n, 5,
+                "HomeConnectLocal ($n) - WebSocket PONG empfangen"
+                . ($matched ? "." : " (ohne passenden ausstehenden PING).");
+
+            # The currently scheduled heartbeat callback is the PONG timeout.
+            # Replace it with the next regular 20-second heartbeat interval.
+            RemoveInternalTimer($hash, 'HomeConnectLocal_Heartbeat');
+            InternalTimer(
+                time() + 20,
+                'HomeConnectLocal_Heartbeat',
+                $hash,
+                0
+            );
 
             next;
         }
@@ -5782,6 +5928,14 @@ sub HomeConnectLocal_Close {
 
     delete
         $hash->{WS_FRAGMENT_OPCODE};
+
+    delete
+        $HomeConnectLocal_Private{$n}{WS_HEARTBEAT};
+
+    RemoveInternalTimer(
+        $hash,
+        'HomeConnectLocal_Heartbeat'
+    );
 
 
     $hash->{PARTIAL} =
@@ -7384,4 +7538,3 @@ sub HomeConnectLocal_Attr {
 =cut
 
 1;
-
