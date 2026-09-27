@@ -287,26 +287,10 @@ my %HCL_DE_READING_VALUE = (
     ProgramPhase => {
         MainWash => 'Hauptreinigung',
         PreRinse => 'Vorspülen',
-        FillingDetergent => 'Waschmittel einspülen',
-        DetectingLoad => 'Beladungsanalyse',
-        IntermediateSpin => 'Zwischenschleudern',
-        RinsingSoftener => 'Weichspüler einspülen',
+        FinalRinse => 'Schlussspülung',
         Drying => 'Trocknen',
-        WashingAndDrying => 'Waschen und Trocknen',
-        CupboardDryPlus => 'Schranktrocken Plus',
-        CupboardDry => 'Schranktrocken',
-        Fluffing => 'Auflockern',
-        SpinningFinal => 'Endschleudern',
-        AdditionalCoolingDown => 'Zusätzliches Abkühlen',
-        HotMoistHeatingWetting => 'Befeuchten',
-        HotMoistHeatingHeating => 'Heizen',
-        HotMoistHeatingWashing => 'Waschen',
-        Heating => 'Aufheizen',
-        Rinsing => 'Spülen',
-        Washing => 'Waschen',
-        GuardingWrinkle => 'Knitterschutz',
-        CoolingDown => 'Abkühlen',
     },
+
 );
 
 my %HCL_EN_READING_VALUE = (
