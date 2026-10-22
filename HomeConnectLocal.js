@@ -110,6 +110,9 @@
       }
       function close(){generation++;cmd('set '+dev+' programConfigSession end').catch(function(){});overlay.remove();}
       fillPrograms(cfg);render(cfg,true);
+      // Backofen: initial vorgeschlagenes Programm wie bei manueller Auswahl
+      // laden, wenn beim ersten Oeffnen noch keine Optionen vorhanden sind.
+      if (!(cfg.options || []).length && sel.value) selectProgram(sel.value);
       overlay.querySelector('.hcl-x').addEventListener('click',close);overlay.querySelector('.hcl-cancel').addEventListener('click',close);overlay.addEventListener('click',function(e){if(e.target===overlay)close();});
       sel.addEventListener('change',function(){if(!busy)selectProgram(sel.value);});
       send.addEventListener('click',function(){
