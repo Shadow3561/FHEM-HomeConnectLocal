@@ -9,12 +9,13 @@
 #    - Dishwasher
 #    - Hob
 #    - Washer / WasherDryer
+#    - Oven
 #
 #  Device capabilities, programs, settings and options are loaded dynamically
 #  from external Home Connect DeviceDescription and FeatureMapping XML files.
 #
-#  Version 1.41, 26.09.2026
-#  $Id: 70_HomeConnectLocal.pm 1.41 2026-09-26 $
+#  Version 1.59-7, 22.10.2026
+#  $Id: 70_HomeConnectLocal.pm 1.59-7 2026-10-22 $
 #
 ########################################################################################
 #
@@ -69,6 +70,10 @@
 #  1.38      LastSetList Internal formatted with line breaks for FHEMWEB
 #  1.39      LastSetList uses real newlines; long enum/program entries wrap at commas
 #  1.40      Hob SetList restricted to a conservative whitelist of safe settings
+#  1.42      Oven deviceType, oven program popup/options and guarded Pyrolysis start
+#  1.43      Oven prepared-program context persists program/options in readings and start restores them
+#  1.59-4    IPv6/FQDN proxy support from v1.61; guard unavailable oven ChildLock
+#  1.59-3    Oven AlarmClock in SetList; clear stale protocol_error after successful RO response
 #  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
 #
 ########################################################################################
@@ -84,8 +89,9 @@ use strict;
 use warnings;
 use JSON::PP;
 use IO::Socket::INET;
+use IO::Socket::IP;
 use MIME::Base64;
-use Digest::SHA qw(hmac_sha256);
+use Digest::SHA qw(hmac_sha256 sha256_hex);
 use Crypt::Mode::CBC;
 use Encode qw(decode FB_CROAK);
 
@@ -94,7 +100,7 @@ use Encode qw(decode FB_CROAK);
 my %HomeConnectLocal_Private;
 
 # Central module version. Also exposed in each device as MODULE_VERSION.
-my $HomeConnectLocal_VERSION = '1.41';
+my $HomeConnectLocal_VERSION = '1.59-7';
 
 
 ##############################################
@@ -123,7 +129,7 @@ sub HomeConnectLocal_Initialize {
         . "encryptionKey "
         . "connectionType:TLS,AES "
         . "iv "
-        . "deviceType:dishwasher,hob,washer,washerdryer "
+        . "deviceType:dishwasher,hob,oven,washer,washerdryer "
         . "mappingDir "
         . "mappingPrefix "
         . "excludeReadings "
@@ -131,6 +137,7 @@ sub HomeConnectLocal_Initialize {
         . "excludeSets "
         . "translation:off,DE,EN "
         . "programPopup:on,off "
+        . "programStartJsonMode:normal,ordered "
         . $main::readingFnAttributes;
 
     use strict 'vars';
@@ -1166,7 +1173,11 @@ sub HomeConnectLocal_BuildSetMap {
         my $static = $m->{MetaByUID}{$uid};
         next if ref($static) ne 'HASH';
 
-        my $meta = HomeConnectLocal_GetEffectiveMeta($hash, $uid);
+        # v1.53: Hob menu capabilities come from static XML, not volatile
+        # /ro/descriptionChange permissions. Runtime still applies to writes.
+        my $stable_hob = lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob';
+        my $meta = $stable_hob ? { %$static }
+                               : HomeConnectLocal_GetEffectiveMeta($hash, $uid);
         $meta = $static if ref($meta) ne 'HASH';
 
         my $kind = $static->{kind} || $meta->{kind} || '';
@@ -1589,7 +1600,36 @@ sub HomeConnectLocal_SetList {
     my ($hash) = @_;
 
     my @list = ('connect:noArg', 'disconnect:noArg', 'reloadMapping:noArg');
+    push @list, 'diagGetPostChildLock:on,off', 'diagPostEndpoints:on,off', 'diagGet:noArg', 'diagGetRaw:noArg'
+        if lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob';
+    push @list, 'stopwatch:start,pause,resume,stop,toggle'
+        if lc(AttrVal($hash->{NAME}, 'deviceType', '')) =~ /^(?:oven|hob)$/;
+    # v1.59-3: The oven alarm is independent of remote program start.
+    # It already works via the generic XML setting handler (UID 0235).
+    # Expose it also while a program is running, using the XML limits.
+    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'oven'
+        && ref($hash->{HC_SETMAP}) eq 'HASH'
+        && ref($hash->{HC_SETMAP}{AlarmClock}) eq 'HASH'
+        && ($hash->{HC_SETMAP}{AlarmClock}{kind} // '') eq 'setting') {
+        my $alarm = $hash->{HC_SETMAP}{AlarmClock};
+        my $access = lc($alarm->{access} // '');
+        my $available = lc($alarm->{available} // 'true');
+        if ($access =~ /^(?:readwrite|writeonly)$/ && $available ne 'false') {
+            my $spec = 'AlarmClock';
+            if (defined($alarm->{min}) && defined($alarm->{max})) {
+                my $step = defined($alarm->{stepSize}) && $alarm->{stepSize} > 0
+                    ? $alarm->{stepSize} : 1;
+                $spec .= ':slider,' . $alarm->{min} . ',' . $step . ',' . $alarm->{max};
+            } else {
+                $spec .= ':textField';
+            }
+            push @list, $spec;
+        }
+    }
+
+    my $stable_hob = lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob';
     my $running = HomeConnectLocal_IsProgramRunning($hash);
+    my $menu_running = $running && !$stable_hob;
 
     my $programs = $hash->{HC_PROGRAMS};
     if (ref($programs) eq 'ARRAY' && @$programs) {
@@ -1597,7 +1637,7 @@ sub HomeConnectLocal_SetList {
                     grep { ref($_) eq 'HASH' && defined($_->{name}) && $_->{name} ne '' }
                     @$programs;
         my @display_names = map { HomeConnectLocal_SetDisplayToken($hash, 'program', $_) } @names;
-        push @list, 'program:' . join(',', @display_names) if @display_names && !$running;
+        push @list, 'program:' . join(',', @display_names) if @display_names && !$menu_running;
 
         # Keep the first set level compact: one option selector containing
         # only options valid for the currently selected program.
@@ -1673,13 +1713,13 @@ sub HomeConnectLocal_SetList {
             }
         }
 
-        push @list, 'start:noArg' if !$running;
+        push @list, 'start:noArg' if !$menu_running;
         push @list, 'stop:noArg';
-        push @list, 'power:on,off' if !$running;
+        push @list, 'power:on,off' if !$menu_running;
 
         # Writable XML settings become direct FHEM SET commands.
         # This gives FHEMWEB a normal two-level command/value dropdown.
-        if (!$running && ref($hash->{HC_SETMAP}) eq 'HASH') {
+        if (!$menu_running && ref($hash->{HC_SETMAP}) eq 'HASH') {
             for my $setting_name (sort keys %{ $hash->{HC_SETMAP} }) {
                 my $e = $hash->{HC_SETMAP}{$setting_name};
                 next if ref($e) ne 'HASH';
@@ -1688,6 +1728,7 @@ sub HomeConnectLocal_SetList {
                 next if lc($e->{access} // '') !~ /^(?:readwrite|writeonly)$/;
                 next if defined($e->{available}) && lc("$e->{available}") eq 'false';
                 next if $setting_name eq 'PowerState'; # handled by power:on,off
+                next if $setting_name eq 'AlarmClock' && lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'oven'; # exposed above even while running
 
                 my $enum_type = $e->{enumerationType};
                 if ((!defined($enum_type) || $enum_type eq '')
@@ -1734,47 +1775,9 @@ sub HomeConnectLocal_SetList {
         !HomeConnectLocal_SetExcluded($hash, $setname)
     } @list;
 
-    # v1.40: Hob control is intentionally conservative.  Keep the complete
-    # mapping/runtime metadata internally, but expose only explicitly approved
-    # non-cooking settings in FHEMWEB.  The whitelist is built from canonical
-    # set names and converted through the active translation so it also works
-    # with translation=off/DE/EN.  Connection/mapping commands stay available.
-    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob') {
-        my %hob_allowed = map { $_ => 1 } qw(
-            connect
-            disconnect
-            reloadMapping
-        );
-
-        for my $canonical (qw(
-            AlarmClock
-            AllowBackendConnection
-            AllowConsumerInsights
-            AutomaticKeyLock
-            ButtonTones
-            BuzzerBeepLevel
-            ChildLock
-            DisplayBrandLogo
-            DisplayBrightness
-            EndTimerSignalduration
-            EnergyConsumptionIndication
-            HoodAfterRun
-            HoodAutomaticLightOff
-            HoodAutomaticLightOn
-            HoodAutomaticStart
-            Language
-            QuickAdjust
-            RestoreTimer
-        )) {
-            $hob_allowed{$canonical} = 1;
-            $hob_allowed{HomeConnectLocal_SetDisplayToken($hash, 'option', $canonical)} = 1;
-        }
-
-        @list = grep {
-            my ($setname) = split(/:/, $_, 2);
-            $hob_allowed{$setname}
-        } @list;
-    }
+    # v1.46-hob-test: expose dynamic SETs for hob, as requested for testing.
+    # Device runtime permissions remain authoritative; this removes only
+    # the FHEMWEB SetList whitelist, not appliance-side restrictions.
 
     my $setlist = join(' ', @list);
 
@@ -1843,6 +1846,10 @@ sub HomeConnectLocal_RefreshFhemWebSetListIfChanged {
 
     # On the first calculation there is no browser-side list to invalidate.
     return if !defined($old) && !$force;
+    # v1.54: A hob runtime event is not a reason to reload the page
+    # when its stable XML-backed menu has not changed.
+    return if defined($old) && $old eq $new
+        && lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'hob';
     return if !$force && $old eq $new;
 
     my $why = (defined($old) && $old ne $new)
@@ -1850,10 +1857,11 @@ sub HomeConnectLocal_RefreshFhemWebSetListIfChanged {
         : 'Runtime-Kontext geaendert';
     Log3 $hash->{NAME}, 5,
         "HomeConnectLocal ($hash->{NAME}) - FHEMWEB $why -> Browser-Refresh";
+    # Avoid logging multi-kilobyte lists on every real context change.
     Log3 $hash->{NAME}, 5,
-        "HomeConnectLocal ($hash->{NAME}) - FHEMWEB SetList ALT: " . (defined($old) ? $old : '<undef>');
-    Log3 $hash->{NAME}, 5,
-        "HomeConnectLocal ($hash->{NAME}) - FHEMWEB SetList NEU: $new";
+        "HomeConnectLocal ($hash->{NAME}) - FHEMWEB SetList changed: "
+        . "oldLength=" . (defined($old) ? length($old) : 0)
+        . " newLength=" . length($new);
 
     no strict 'vars';
     return if !defined(&FW_directNotify);
@@ -2219,6 +2227,15 @@ sub HomeConnectLocal_UpdateMappedValue {
         1
     );
 
+    # v1.55: Track stopwatch status when operated directly on the appliance
+    # or through the official app. These are read-only diagnostics.
+    if ($f eq 'BSH.Common.Status.StopWatchState'
+        || $f eq 'BSH.Common.Status.StopWatchTime') {
+        my $raw = defined($value) && !ref($value) ? $value : '<non-scalar>';
+        Log3 $hash->{NAME}, 3, 'HomeConnectLocal (' . $hash->{NAME}
+            . ") - STOPWATCH STATUS: feature=$f uid=$uid raw=$raw mapped=$mv reading=$r";
+    }
+
     # Keep the local program candidate in sync with the appliance.
     # This is important for the dynamic set option:<...> list:
     # - after "set ... program ..." the candidate is available immediately
@@ -2408,6 +2425,11 @@ sub HomeConnectLocal_AESInit {
     #
     # Zähler nur zur Diagnose.
     #
+    # Each fresh AES session gets a separate diagnostic request ledger.
+    $HomeConnectLocal_Private{$n}{PROTO_DIAG_PENDING} = {};
+    $HomeConnectLocal_Private{$n}{PROTO_DIAG_FIRST_MISSING} = undef;
+    $HomeConnectLocal_Private{$n}{PROTO_DIAG_SEQ} = 0;
+
     $HomeConnectLocal_Private{$hash->{NAME}}{AES_TX_COUNT} = 0;
     $HomeConnectLocal_Private{$hash->{NAME}}{AES_RX_COUNT} = 0;
 
@@ -2506,6 +2528,20 @@ sub HomeConnectLocal_AESEncrypt {
         return undef;
     }
 
+    # v1.59-2: A missing/invalid session key must never terminate FHEM.
+    my $aes_state = $HomeConnectLocal_Private{$n} || {};
+    for my $field (['AES_ENC_KEY', 32], ['AES_TX_IV', 16],
+                   ['AES_IV', 16], ['AES_MAC_KEY', 32],
+                   ['AES_LAST_TX_HMAC', 16]) {
+        my ($key, $length) = @$field;
+        if (!defined($aes_state->{$key}) || ref($aes_state->{$key})
+            || length($aes_state->{$key}) != $length) {
+            Log3 $n, 3, "HomeConnectLocal ($n) - AES TX abgebrochen: "
+                . "ungueltiger Session-State ($key). Bitte neu verbinden.";
+            return undef;
+        }
+    }
+
     my $current_iv =
         $HomeConnectLocal_Private{$hash->{NAME}}{AES_TX_IV};
 
@@ -2522,12 +2558,17 @@ sub HomeConnectLocal_AESEncrypt {
             0
         );
 
-    my $enc =
+    my $enc = eval {
         $cbc->encrypt(
             $plain,
             $HomeConnectLocal_Private{$hash->{NAME}}{AES_ENC_KEY},
             $current_iv
         );
+    };
+    if ($@) {
+        Log3 $n, 3, "HomeConnectLocal ($n) - AES TX Fehler abgefangen: $@";
+        return undef;
+    }
 
     if (!defined($enc)) {
 
@@ -2571,6 +2612,14 @@ sub HomeConnectLocal_AESEncrypt {
     # Erst nach erfolgreicher Berechnung
     # Zustand fortschreiben.
     #
+    # Non-secret truncated fingerprints for chain continuity; no key/IV/HMAC bytes logged.
+    Log3 $n, 5, "HomeConnectLocal ($n) - AES TX CHAIN: "
+        . "nextSeq=" . (($HomeConnectLocal_Private{$n}{AES_TX_COUNT} // 0) + 1)
+        . " ivBeforeHash=" . substr(sha256_hex($current_iv), 0, 12)
+        . " ivAfterHash=" . substr(sha256_hex($next_iv), 0, 12)
+        . " prevMacHash=" . substr(sha256_hex($HomeConnectLocal_Private{$n}{AES_LAST_TX_HMAC}), 0, 12)
+        . " nextMacHash=" . substr(sha256_hex($mac), 0, 12);
+
     $HomeConnectLocal_Private{$hash->{NAME}}{AES_TX_IV} =
         $next_iv;
 
@@ -2657,6 +2706,20 @@ sub HomeConnectLocal_AESDecrypt {
     my $current_iv =
         $HomeConnectLocal_Private{$hash->{NAME}}{AES_RX_IV};
 
+
+    # v1.59-2: protect the receive path from invalid session state.
+    my $aes_state = $HomeConnectLocal_Private{$n} || {};
+    for my $field (['AES_ENC_KEY', 32], ['AES_RX_IV', 16],
+                   ['AES_IV', 16], ['AES_MAC_KEY', 32],
+                   ['AES_LAST_RX_HMAC', 16]) {
+        my ($key, $length) = @$field;
+        if (!defined($aes_state->{$key}) || ref($aes_state->{$key})
+            || length($aes_state->{$key}) != $length) {
+            Log3 $n, 3, "HomeConnectLocal ($n) - AES RX abgebrochen: "
+                . "ungueltiger Session-State ($key). Bitte neu verbinden.";
+            return undef;
+        }
+    }
 
     #
     # Erwarteten HMAC berechnen.
@@ -2767,12 +2830,17 @@ sub HomeConnectLocal_AESDecrypt {
             0
         );
 
-    my $clear =
+    my $clear = eval {
         $cbc->decrypt(
             $enc,
             $HomeConnectLocal_Private{$hash->{NAME}}{AES_ENC_KEY},
             $current_iv
         );
+    };
+    if ($@) {
+        Log3 $n, 3, "HomeConnectLocal ($n) - AES RX Fehler abgefangen: $@";
+        return undef;
+    }
 
 
     if (!defined($clear) || !length($clear)) {
@@ -2966,6 +3034,43 @@ sub HomeConnectLocal_OpenWebSocket {
 # Connect
 ##############################################
 
+# Link-local IPv6 requires a scope. Probe numeric interface indices rather than
+# assuming OS-specific names (eth0/en0/...). Explicit %scope always wins.
+# Cache only successful discoveries; retry on reconnect after a network change.
+sub HomeConnectLocal_ResolveLinkLocalHost {
+    my ($hash, $host, $port) = @_;
+    return $host if !defined($host) || $host !~ /\Afe[89ab][0-9a-f]:/i;
+    return $host if $host =~ /%[^%]+\z/;
+
+    my $name = $hash->{NAME};
+    my $cache = $hash->{helper}{IPv6LinkLocalScope};
+    if (ref($cache) eq 'HASH' && ($cache->{host} // '') eq $host) {
+        return $cache->{scoped};
+    }
+
+    # The same fe80:: address can exist on multiple links. Test actual TCP
+    # reachability on the device's port; never select a scope by route metric.
+    # Index values are OS-defined; a bounded probe avoids indefinite blocking.
+    for my $idx (1 .. 64) {
+        my $candidate = "$host%$idx";
+        my $probe = IO::Socket::IP->new(
+            PeerHost => $candidate,
+            PeerPort => $port,
+            Type     => Socket::SOCK_STREAM(),
+            Timeout  => 0.15,
+        );
+        next if !$probe;
+        close($probe);
+        $hash->{helper}{IPv6LinkLocalScope} = {
+            host => $host, scoped => $candidate,
+        };
+        Log3 $name, 3, "HomeConnectLocal ($name) - IPv6 Link-Local Scope automatisch ermittelt: %$idx";
+        return $candidate;
+    }
+    Log3 $name, 3, "HomeConnectLocal ($name) - IPv6 Link-Local ohne Scope nicht erreichbar; bitte %Schnittstelle oder %Index angeben";
+    return undef;
+}
+
 sub HomeConnectLocal_Connect {
     my ($hash) = @_;
 
@@ -2999,6 +3104,18 @@ sub HomeConnectLocal_Connect {
 
     $hash->{ConnectionType} =
         $ct;
+
+    # IPv4, ULA and FQDN remain untouched. Resolve only unscoped fe80:: hosts.
+    if (defined($host) && $host =~ /\Afe[89ab][0-9a-f]:/i && $host !~ /%[^%]+\z/) {
+        my $scoped = HomeConnectLocal_ResolveLinkLocalHost(
+            $hash, $host, $ct eq 'AES' ? 80 : 443
+        );
+        if (!defined($scoped)) {
+            InternalTimer(time() + 10, 'HomeConnectLocal_Connect', $hash, 0);
+            return;
+        }
+        $host = $scoped;
+    }
 
     my $psk =
         HomeConnectLocal_Base64UrlDecode(
@@ -3068,13 +3185,15 @@ sub HomeConnectLocal_Connect {
                 $iv
             );
 
-        my $s =
-            IO::Socket::INET->new(
-                PeerAddr => $host,
-                PeerPort => 80,
-                Proto    => 'tcp',
-                Timeout  => 5
-            );
+        # IO::Socket::INET only supports IPv4. IO::Socket::IP handles
+        # IPv4, DNS (A/AAAA) and IPv6 literals including %interface zones.
+        # Keep the zone in PeerHost, but omit it from the HTTP Host header.
+        my $s = IO::Socket::IP->new(
+            PeerHost => $host,
+            PeerPort => 80,
+            Type     => Socket::SOCK_STREAM(),
+            Timeout  => 5
+        );
 
         if (!$s) {
 
@@ -3098,11 +3217,14 @@ sub HomeConnectLocal_Connect {
             . "TCP/AES Kanal zu "
             . "$host:80 verbunden.";
 
+        my $ws_host = $host;
+        $ws_host =~ s/%[^%]+$// if $ws_host =~ /:/;
+        $ws_host = "[$ws_host]" if $ws_host =~ /:/ && $ws_host !~ /^\[/;
         my $ok =
             HomeConnectLocal_OpenWebSocket(
                 $hash,
                 $s,
-                "$host:80"
+                "$ws_host:80"
             );
 
         if (!$ok) {
@@ -3162,15 +3284,17 @@ sub HomeConnectLocal_Connect {
             $psk
         );
 
-    my @ip =
-        split(
-            /\./,
-            $host
-        );
-
-    my $lp =
-        10000 +
-        $ip[-1];
+    # Keep the established port for IPv4 devices. For DNS names,
+    # derive a stable local port without interpreting a hostname as a number.
+    # This is only the LOCAL socat listener port, not the appliance port.
+    my $lp;
+    if ($host =~ /\A(?:\d{1,3}\.){3}(\d{1,3})\z/ && $1 <= 255) {
+        $lp = 10000 + $1;
+    } else {
+        # Stable across restarts; unlike Perl's hash(), SHA is deterministic.
+        # The device name distinguishes FHEM instances using the same FQDN.
+        $lp = 20000 + (hex(substr(sha256_hex($name), 0, 8)) % 40000);
+    }
 
     $hash->{LocalPort} =
         $lp;
@@ -3184,11 +3308,22 @@ sub HomeConnectLocal_Connect {
         "pkill -f 'socat.*LISTEN:$lp'"
     );
 
+    # OpenSSL expects bracketed IPv6 literals in host:port notation.
+    # DNS names (including AAAA records) and IPv4 remain unchanged.
+    my $tls_host = $host;
+    if ($tls_host =~ /:/ && $tls_host !~ /^\[.*\]$/) {
+        $tls_host = "[$tls_host]";
+    }
+    # socat EXEC parses ':' as an address separator, including inside
+    # bracketed IPv6 literals. Escape EVERY colon for socat, not only :443.
+    # The surrounding shell single quotes preserve these backslashes.
+    $tls_host =~ s/:/\\:/g if $tls_host =~ /:/;
+
     my $cmd =
           "socat "
         . "TCP-LISTEN:$lp,reuseaddr,fork "
         . "EXEC:'openssl s_client "
-        . "-connect $host\\:443 "
+        . "-connect $tls_host\\:443 "
         . "-tls1_2 "
         . "-psk $hex "
         . "-noservername "
@@ -3540,6 +3675,29 @@ sub HomeConnectLocal_SendJSON {
 }
 
 
+# v1.46: diagnostic only; never blocks an outgoing command.
+sub HomeConnectLocal_LogWritePermission {
+    my ($hash, $uid_num, $context) = @_;
+    my $uid = sprintf('%04X', $uid_num);
+    my $meta = $hash->{RuntimeMeta}{$uid};
+    my @entries;
+    if (ref($meta) eq 'HASH') {
+        for my $parent (sort keys %{ $meta->{parents} || {} }) {
+            my $v = $meta->{parents}{$parent};
+            push @entries, "parent=$parent access=" . ($v->{access} // '?')
+                . " available=" . (defined($v->{available}) ? $v->{available} : '?');
+        }
+        if (ref($meta->{global}) eq 'HASH') {
+            my $v = $meta->{global};
+            push @entries, "global access=" . ($v->{access} // '?')
+                . " available=" . (defined($v->{available}) ? $v->{available} : '?');
+        }
+    }
+    Log3 $hash->{NAME}, 4, "HomeConnectLocal ($hash->{NAME}) - WRITE PERMISSION: "
+        . "context=$context uid=$uid_num xmlUID=$uid runtime="
+        . (@entries ? join('; ', @entries) : '<unknown>');
+}
+
 sub HomeConnectLocal_SendProtocol {
     my (
         $hash,
@@ -3559,6 +3717,15 @@ sub HomeConnectLocal_SendProtocol {
         );
 
 
+    if ($act eq 'POST' && ref($data) eq 'HASH') {
+        if ($res eq '/ro/values' && defined($data->{uid})) {
+            HomeConnectLocal_LogWritePermission($hash, $data->{uid}, $res);
+        } elsif ($res eq '/ro/activeProgram' || $res eq '/ro/selectedProgram') {
+            HomeConnectLocal_LogWritePermission($hash,
+                $res eq '/ro/activeProgram' ? 256 : 257, $res);
+        }
+    }
+
     my $m = {
         sID      => 0 + $hash->{SessionID},
         msgID    => 0 + $hash->{TxMsgID},
@@ -3573,11 +3740,119 @@ sub HomeConnectLocal_SendProtocol {
         if defined($data);
 
 
-    my $r =
-        HomeConnectLocal_SendRaw(
+    if (($hash->{ConnectionType} // 'TLS') eq 'AES') {
+        Log3 $hash->{NAME}, 4,
+            "HomeConnectLocal ($hash->{NAME}) - AES PROTOCOL TX: "
+            . "sID=$m->{sID} msgID=$m->{msgID} "
+            . "action=$act resource=$res version=$ver "
+            . "dataType=" . (defined($data) ? ref($data) || 'scalar' : 'none');
+    }
+
+    # v1.52: AES peers may require the reference protocol field order.
+    # Keep the same logical payload and SendRaw/AES implementation.
+    # Encode values individually so strings and nested data remain JSON-safe.
+    my $json;
+    if (($hash->{ConnectionType} // 'TLS') eq 'AES') {
+        $json = '{'
+            . '"sID":'      . encode_json($m->{sID})
+            . ',"msgID":'    . encode_json($m->{msgID})
+            . ',"resource":' . encode_json($m->{resource})
+            . ',"version":'  . encode_json($m->{version})
+            . ',"action":'   . encode_json($m->{action});
+        # v1.58: The hob rejects /ro/values commands if the nested
+        # object is serialized as {"value":...,"uid":...} (code 400).
+        # Serialize uid before value deterministically; do not rely on
+        # Perl hash iteration order. All other payloads remain unchanged.
+        if (exists $m->{data} && $res eq '/ro/values'
+            && $act eq 'POST' && ref($data) eq 'HASH'
+            && exists($data->{uid}) && exists($data->{value})
+            && keys(%$data) == 2) {
+            $json .= ',"data":[{"uid":' . encode_json($data->{uid})
+                . ',"value":' . encode_json($data->{value}) . '}]';
+        } elsif (exists $m->{data} && $res eq '/ro/activeProgram'
+            && $act eq 'POST' && ref($data) eq 'HASH'
+            && lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'oven'
+            && AttrVal($hash->{NAME}, 'programStartJsonMode', 'ordered') eq 'ordered'
+            && exists($data->{program})) {
+            # v1.59 test mode: reference-style deterministic nested key order.
+            # Only the oven's activeProgram POST is affected.
+            # Do not modify the original data, option values, or option order.
+            my $body = '{"program":' . encode_json($data->{program});
+            if (exists $data->{options}) {
+                if (ref($data->{options}) eq 'ARRAY') {
+                    my @items;
+                    for my $opt (@{$data->{options}}) {
+                        if (ref($opt) eq 'HASH' && exists($opt->{uid})
+                            && exists($opt->{value}) && keys(%$opt) == 2) {
+                            push @items, '{"uid":' . encode_json($opt->{uid})
+                                . ',"value":' . encode_json($opt->{value}) . '}';
+                        } else {
+                            push @items, encode_json($opt);
+                        }
+                    }
+                    $body .= ',"options":[' . join(',', @items) . ']';
+                } else {
+                    $body .= ',"options":' . encode_json($data->{options});
+                }
+            }
+            for my $key (sort grep { $_ ne 'program' && $_ ne 'options' } keys %$data) {
+                $body .= ',' . encode_json($key) . ':' . encode_json($data->{$key});
+            }
+            $body .= '}';
+            $json .= ',"data":[' . $body . ']';
+        } else {
+            $json .= ',"data":' . encode_json($m->{data}) if exists $m->{data};
+        }
+        $json .= '}';
+    } else {
+        $json = encode_json($m);
+    }
+
+    my $r = HomeConnectLocal_SendRaw($hash, $json);
+
+    # v1.50: track ALL outgoing protocol requests, not just POST.
+    # Matching happens in the common inbound dispatcher, including handshake replies.
+    if ($r && ($act eq 'GET' || $act eq 'POST')) {
+        my $pd = $HomeConnectLocal_Private{$hash->{NAME}};
+        my $seq = ++$pd->{PROTO_DIAG_SEQ};
+        $pd->{PROTO_DIAG_PENDING}{0 + $m->{msgID}} = {
+            resource => $res, action => $act, sent_at => time(),
+            sid => $m->{sID}, seq => $seq, timeout_reported => 0,
+        };
+        Log3 $hash->{NAME}, 3, "HomeConnectLocal ($hash->{NAME}) - PROTO DIAG TX: "
+            . "seq=$seq msgID=$m->{msgID} sid=$m->{sID} $act $res "
+            . "aesTX=" . ($pd->{AES_TX_COUNT} // '-') . " socket=OK";
+        InternalTimer(time() + 8, 'HomeConnectLocal_ProtoDiagTimeout', $hash, 0);
+    }
+
+    # Diagnostic tracking for program preparation/start.  This changes no
+    # protocol data; it only lets us correlate a RESPONSE (or its absence)
+    # with the exact POST that was sent.
+    if (
+        $r &&
+        $act eq 'POST' &&
+        ($res eq '/ro/selectedProgram' || $res eq '/ro/activeProgram' || $res eq '/ro/values' || $res eq '/ro/descriptionChange')
+    ) {
+        my $mid = 0 + $m->{msgID};
+        $HomeConnectLocal_Private{$hash->{NAME}}{RO_PENDING}{$mid} = {
+            resource => $res,
+            action   => $act,
+            sent_at  => time(),
+            data     => defined($data) ? encode_json($data) : ''
+        };
+
+        Log3 $hash->{NAME}, 5,
+            "HomeConnectLocal ($hash->{NAME}) - RO REQUEST TRACK: "
+          . "msgID=$mid resource=$res action=$act data="
+          . (defined($data) ? encode_json($data) : '<none>');
+
+        InternalTimer(
+            time() + 5,
+            'HomeConnectLocal_RORequestTimeout',
             $hash,
-            encode_json($m)
+            0
         );
+    }
 
 
     #
@@ -4940,6 +5215,66 @@ sub HomeConnectLocal_InitialHandshake {
     return;
 }
 ##############################################
+# Diagnostic timeout for program POST responses
+##############################################
+
+# v1.50: mark the first unanswered protocol request of each AES session.
+sub HomeConnectLocal_ProtoDiagTimeout {
+    my ($hash) = @_;
+    return if !$hash;
+    my $n = $hash->{NAME};
+    my $pd = $HomeConnectLocal_Private{$n};
+    my $pending = $pd->{PROTO_DIAG_PENDING};
+    return if ref($pending) ne 'HASH';
+    my $now = time();
+    for my $mid (sort { ($pending->{$a}{seq} // 0) <=> ($pending->{$b}{seq} // 0) } keys %$pending) {
+        my $p = $pending->{$mid};
+        next if ref($p) ne 'HASH';
+        my $age = $now - $p->{sent_at};
+        if ($age > 120) { delete $pending->{$mid}; next; }
+        next if $age < 7.5 || $p->{timeout_reported};
+        $p->{timeout_reported} = 1;
+        Log3 $n, 3, "HomeConnectLocal ($n) - PROTO DIAG TIMEOUT: "
+            . "seq=$p->{seq} msgID=$mid sid=$p->{sid} "
+            . "$p->{action} $p->{resource} age=${age}s";
+        if (!defined($pd->{PROTO_DIAG_FIRST_MISSING})) {
+            $pd->{PROTO_DIAG_FIRST_MISSING} = $p->{seq};
+            Log3 $n, 3, "HomeConnectLocal ($n) - PROTO DIAG FIRST UNANSWERED: "
+                . "seq=$p->{seq} msgID=$mid $p->{action} $p->{resource}";
+        }
+    }
+}
+
+sub HomeConnectLocal_RORequestTimeout {
+    my ($hash) = @_;
+    return if !$hash;
+
+    my $n = $hash->{NAME};
+    my $pending = $HomeConnectLocal_Private{$n}{RO_PENDING};
+    return if ref($pending) ne 'HASH';
+
+    my $now = time();
+    for my $mid (sort { $a <=> $b } keys %$pending) {
+        my $p = $pending->{$mid};
+        next if ref($p) ne 'HASH';
+        my $age = $now - ($p->{sent_at} // $now);
+        if ($age > 120) { delete $pending->{$mid}; next; }
+        next if $age < 4.5 || $p->{timeout_reported};
+
+        Log3 $n, 3,
+            "HomeConnectLocal ($n) - RO RESPONSE TIMEOUT: "
+          . "keine RESPONSE innerhalb 5s fuer "
+          . "msgID=$mid resource=" . ($p->{resource} // '-')
+          . " requestData=" . ($p->{data} // '');
+
+        $p->{timeout_reported} = 1;
+    }
+
+    return;
+}
+
+
+##############################################
 # Process JSON Payload
 ##############################################
 
@@ -5021,6 +5356,97 @@ sub HomeConnectLocal_ProcessPayload {
             $d->{action},
             1
         );
+    }
+
+    # v1.50: correlate responses before any special-purpose handler returns.
+    if (($d->{action} // '') =~ /^(?:RESPONSE|ERROR)$/i && defined($d->{msgID})) {
+        my $pd = $HomeConnectLocal_Private{$n};
+        my $p = delete $pd->{PROTO_DIAG_PENDING}{0 + $d->{msgID}};
+        if (ref($p) eq 'HASH') {
+            Log3 $n, 3, "HomeConnectLocal ($n) - PROTO DIAG RX MATCH: "
+                . "seq=$p->{seq} msgID=$d->{msgID} "
+                . "$p->{action} $p->{resource} "
+                . "rxAction=$d->{action} rxResource=" . ($d->{resource} // '-')
+                . " code=" . (defined($d->{code}) ? $d->{code} : '-')
+                . " elapsed=" . (time() - $p->{sent_at}) . "s"
+                . " late=" . ($p->{timeout_reported} ? 'yes' : 'no');
+        } else {
+            Log3 $n, 4, "HomeConnectLocal ($n) - PROTO DIAG RX UNMATCHED: "
+                . "msgID=$d->{msgID} action=$d->{action} "
+                . "resource=" . ($d->{resource} // '-');
+        }
+    }
+
+    # Correlate read-only diagnostic before the normal /ci/info handler.
+    if (($d->{action} // '') =~ /^(?:RESPONSE|ERROR)$/i
+        && defined($d->{msgID})) {
+        my $diag = $HomeConnectLocal_Private{$n}{DIAG_GET};
+        if (ref($diag) eq 'HASH' && $d->{msgID} == $diag->{msgID}) {
+            Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET RESPONSE: "
+                . "msgID=$d->{msgID} action=" . ($d->{action} // '?')
+                . " resource=" . ($d->{resource} // '?')
+                . " code=" . (defined($d->{code}) ? $d->{code} : '<none>')
+                . " elapsed=" . sprintf('%.2f', time() - $diag->{sent_at}) . 's';
+            delete $HomeConnectLocal_Private{$n}{DIAG_GET};
+            # Do not run the initial handshake state machine again on this diagnostic reply.
+            return;
+        }
+    }
+
+    if (($d->{resource} // '') =~ m{^/ro/(?:selectedProgram|activeProgram)$}
+        || (($d->{action} // '') =~ /^(?:RESPONSE|ERROR)$/i
+            && ref($HomeConnectLocal_Private{$n}{RO_PENDING}) eq 'HASH'
+            && keys %{ $HomeConnectLocal_Private{$n}{RO_PENDING} })) {
+        Log3 $n, 5, "HomeConnectLocal ($n) - RO RX DIAGNOSTIC: " . encode_json($d);
+    }
+
+    if (($d->{action} // '') eq 'NOTIFY'
+        && ($d->{resource} // '') eq '/ro/descriptionChange') {
+        HomeConnectLocal_ParseDescriptionChanges($hash, $d);
+        HomeConnectLocal_BuildSetMap($hash);
+        Log3 $n, 4, "HomeConnectLocal ($n) - LIVE DESCRIPTION CHANGE verarbeitet";
+        return;
+    }
+
+    # Full diagnostic for responses to tracked RO POST requests, including
+    # /ro/activeProgram.  Log code/error/data exactly as received.
+    if (
+        ($d->{action} // '') =~ /^(?:RESPONSE|ERROR)$/ &&
+        defined($d->{msgID})
+    ) {
+        my $mid = 0 + $d->{msgID};
+        my $pending = $HomeConnectLocal_Private{$n}{RO_PENDING};
+        if (ref($pending) eq 'HASH' && ref($pending->{$mid}) eq 'HASH') {
+            my $p = delete $pending->{$mid};
+            my $rx_json;
+            eval { $rx_json = encode_json($d); 1 }
+                or $rx_json = "<encode_json failed: $@>";
+
+            Log3 $n, 5,
+                "HomeConnectLocal ($n) - RO RESPONSE MATCH: "
+              . "msgID=$mid requestResource=" . ($p->{resource} // '-')
+              . " responseResource=" . ($d->{resource} // '-')
+              . " code=" . (defined($d->{code}) ? $d->{code} : '<none>')
+              . " late=" . ($p->{timeout_reported} ? "yes" : "no")
+              . " response=$rx_json";
+
+            # v1.59-3: A confirmed successful appliance action clears only
+            # the stale protocol_error state. Keep last_error for diagnostics.
+            # Never clear on NOTIFY, ERROR, or a rejected RESPONSE.
+            if (uc($d->{action} // '') eq 'RESPONSE'
+                && (!defined($d->{code}) || $d->{code} == 0)
+                && ReadingsVal($n, 'state', '') =~ /^protocol_error_\d+$/) {
+                HomeConnectLocal_ReadingsSingleUpdate($hash, 'state', 'connected', 1);
+                Log3 $n, 4, "HomeConnectLocal ($n) - protocol_error nach erfolgreicher RO RESPONSE zurueckgesetzt";
+            }
+
+            if (defined($d->{code}) && $d->{code} != 0) {
+                Log3 $n, 3,
+                    "HomeConnectLocal ($n) - RO REQUEST ABGELEHNT: "
+                  . "msgID=$mid resource=" . ($p->{resource} // '-')
+                  . " code=$d->{code} response=$rx_json";
+            }
+        }
     }
 
 
@@ -6061,6 +6487,40 @@ sub HomeConnectLocal_AutoStart {
 
 ##############################################
 
+# Experimental sequential POST endpoint diagnostic. This is NOT a supported
+# write path for descriptionChange; no retries and no program activation.
+sub HomeConnectLocal_DiagPostEndpointsNext {
+    my ($hash) = @_;
+    return if !$hash;
+    my $n = $hash->{NAME};
+    my $diag = delete $HomeConnectLocal_Private{$n}{DIAG_POST_ENDPOINTS};
+    return if ref($diag) ne 'HASH';
+    return if !defined($hash->{SessionID}) || !$hash->{CD}
+        || $hash->{SessionID} != $diag->{sid};
+    my $value = $diag->{value} ? JSON::PP::true : JSON::PP::false;
+    my $mid = $hash->{TxMsgID};
+    Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 2/2: "
+        . "POST /ro/descriptionChange msgID=$mid uid=524 (experimental, unsupported)";
+    my $ok = HomeConnectLocal_SendProtocol($hash, '/ro/descriptionChange', 1,
+        'POST', { uid => 524, value => $value });
+    Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 2/2 "
+        . ($ok ? 'socket write OK; wait for RESPONSE/ERROR or timeout' : 'send FAILED');
+}
+
+# Read-only diagnostic: check a known handshake endpoint after initialization.
+sub HomeConnectLocal_DiagGetTimeout {
+    my ($hash) = @_;
+    return if !$hash;
+    my $n = $hash->{NAME};
+    my $p = $HomeConnectLocal_Private{$n}{DIAG_GET};
+    return if ref($p) ne 'HASH';
+    return if time() - ($p->{sent_at} // time()) < 4.5;
+    Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET TIMEOUT: "
+        . "no RESPONSE/ERROR within 5s msgID=$p->{msgID} "
+        . "resource=/ci/info AES_TX=" . ($hash->{AES_TX_COUNT} // '<see AES TX log>');
+    delete $HomeConnectLocal_Private{$n}{DIAG_GET};
+}
+
 sub HomeConnectLocal_Set {
     my (
         $hash,
@@ -6076,6 +6536,113 @@ sub HomeConnectLocal_Set {
         "Unknown argument, choose one of " . HomeConnectLocal_SetList($hash)
         if @a < 2;
 
+
+    # v1.51: identical JSON field ordering and SendRaw path as the last
+    # successful AES handshake GET. No writes or appliance setting changes.
+    if ($a[1] eq 'diagGetRaw') {
+        return 'Only available for deviceType hob'
+            if lc(AttrVal($n, 'deviceType', '')) ne 'hob';
+        return 'Usage: set ' . $n . ' diagGetRaw' if @a != 2;
+        return 'No active protocol session'
+            if !defined($hash->{SessionID}) || !defined($hash->{TxMsgID}) || !$hash->{CD};
+        return 'Diagnostic already running'
+            if ref($HomeConnectLocal_Private{$n}{DIAG_GET}) eq 'HASH';
+        my $mid = 0 + $hash->{TxMsgID};
+        my $sid = 0 + $hash->{SessionID};
+        my $json = '{"sID":' . $sid . ',"msgID":' . $mid
+                 . ',"resource":"/ci/info","version":2,"action":"GET"}';
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET RAW BEGIN: "
+            . "msgID=$mid sID=$sid AES_TX_before="
+            . ($HomeConnectLocal_Private{$n}{AES_TX_COUNT} // '-');
+        my $ok = HomeConnectLocal_SendRaw($hash, $json);
+        return 'GET RAW socket write failed' if !$ok;
+        $hash->{TxMsgID} = $mid + 1;
+        $HomeConnectLocal_Private{$n}{DIAG_GET} = {
+            msgID => $mid, sent_at => time(), sid => $sid
+        };
+        InternalTimer(time() + 5, 'HomeConnectLocal_DiagGetTimeout', $hash, 0);
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET RAW SENT: "
+            . "msgID=$mid AES_TX_after="
+            . ($HomeConnectLocal_Private{$n}{AES_TX_COUNT} // '-')
+            . ' waiting for protocol RESPONSE';
+        return 'RAW GET /ci/info sent; wait 5 seconds and inspect log';
+    }
+
+    if ($a[1] eq 'diagGet') {
+        return 'Only available for deviceType hob'
+            if lc(AttrVal($n, 'deviceType', '')) ne 'hob';
+        return 'Usage: set ' . $n . ' diagGet' if @a != 2;
+        return 'No active protocol session'
+            if !defined($hash->{SessionID}) || !defined($hash->{TxMsgID}) || !$hash->{CD};
+        return 'Diagnostic already running'
+            if ref($HomeConnectLocal_Private{$n}{DIAG_GET}) eq 'HASH';
+        my $mid = 0 + $hash->{TxMsgID};
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET BEGIN: "
+            . "GET /ci/info msgID=$mid sID=$hash->{SessionID} "
+            . "transport=" . ($hash->{ConnectionType} // 'TLS');
+        my $ok = HomeConnectLocal_SendProtocol($hash, '/ci/info', 2, 'GET', undef);
+        return 'GET socket write failed' if !$ok;
+        $HomeConnectLocal_Private{$n}{DIAG_GET} = {
+            msgID => $mid, sent_at => time(), sid => $hash->{SessionID}
+        };
+        InternalTimer(time() + 5, 'HomeConnectLocal_DiagGetTimeout', $hash, 0);
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET SENT: "
+            . "msgID=$mid (socket write only; waiting for protocol RESPONSE)";
+        return 'GET /ci/info sent; wait 5 seconds and inspect log';
+    }
+
+    if ($a[1] eq 'diagPostEndpoints') {
+        return 'Only available for deviceType hob'
+            if lc(AttrVal($n, 'deviceType', '')) ne 'hob';
+        return 'Usage: set ' . $n . ' diagPostEndpoints on|off'
+            if @a != 3 || $a[2] !~ /^(?:on|off)$/;
+        return 'No active protocol session'
+            if !defined($hash->{SessionID}) || !defined($hash->{TxMsgID}) || !$hash->{CD};
+        return 'Diagnostic already running'
+            if ref($HomeConnectLocal_Private{$n}{DIAG_POST_ENDPOINTS}) eq 'HASH';
+        my $value = $a[2] eq 'on' ? JSON::PP::true : JSON::PP::false;
+        my $mid = $hash->{TxMsgID};
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 1/2: "
+            . "POST /ro/values msgID=$mid uid=524 requested=$a[2]";
+        my $ok = HomeConnectLocal_SendProtocol($hash, '/ro/values', 1,
+            'POST', { uid => 524, value => $value });
+        return 'First POST send failed' if !$ok;
+        $HomeConnectLocal_Private{$n}{DIAG_POST_ENDPOINTS} = {
+            sid => $hash->{SessionID}, value => ($a[2] eq 'on' ? 1 : 0)
+        };
+        InternalTimer(time() + 7, 'HomeConnectLocal_DiagPostEndpointsNext', $hash, 0);
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 1/2 socket write OK; "
+            . 'second experimental POST scheduled in 7 seconds';
+        return 'Endpoint diagnostic started; wait 13 seconds and inspect verbose 5 log';
+    }
+
+    # Diagnostic only: identical established transport for GET / POST / GET.
+    # Explicit command required because ChildLock changes the appliance state.
+    if ($a[1] eq 'diagGetPostChildLock') {
+        return 'Only available for deviceType hob'
+            if lc(AttrVal($n, 'deviceType', '')) ne 'hob';
+        return 'Usage: set ' . $n . ' diagGetPostChildLock on|off'
+            if @a != 3 || $a[2] !~ /^(?:on|off)$/;
+        return 'No active protocol session'
+            if !defined($hash->{SessionID}) || !defined($hash->{TxMsgID}) || !$hash->{CD};
+        my $value = $a[2] eq 'on' ? JSON::PP::true : JSON::PP::false;
+        my $sid = $hash->{SessionID};
+        my $start = $hash->{TxMsgID};
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET/POST/GET BEGIN "
+            . "sID=$sid startMsgID=$start uid=524 requested=$a[2] "
+            . "transport=" . ($hash->{ConnectionType} // 'TLS');
+        my $before = HomeConnectLocal_SendProtocol($hash, '/ro/allMandatoryValues', 1, 'GET', undef);
+        my $mid_post = $hash->{TxMsgID};
+        my $post = HomeConnectLocal_SendProtocol($hash, '/ro/values', 1, 'POST', { uid => 524, value => $value });
+        my $after = HomeConnectLocal_SendProtocol($hash, '/ro/allMandatoryValues', 1, 'GET', undef);
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET/POST/GET END "
+            . "before=" . ($before ? 'sent' : 'FAILED')
+            . " post=" . ($post ? 'sent' : 'FAILED')
+            . " after=" . ($after ? 'sent' : 'FAILED')
+            . " postMsgID=$mid_post nextMsgID=" . ($hash->{TxMsgID} // '?')
+            . ' (sent means socket write only, not appliance acceptance)';
+        return 'GET/POST/GET diagnostic sent; inspect FHEM log (verbose 5) and responses';
+    }
 
     if (
         $a[1] eq "connect"
@@ -6133,6 +6700,51 @@ sub HomeConnectLocal_Set {
         return undef;
     }
 
+
+    # v1.57: Confirmed stopwatch control via /ro/values with JSON boolean true.
+    # UID 573 toggles start/pause/resume; UID 574 resets the stopwatch.
+    if ($a[1] eq 'stopwatch') {
+        my $type = lc(AttrVal($n, 'deviceType', ''));
+        return 'stopwatch ist nur fuer oven/hob freigegeben'
+            if $type ne 'oven' && $type ne 'hob';
+        return "Usage: set $n stopwatch start|pause|resume|stop|toggle"
+            if @a != 3 || $a[2] !~ /^(?:start|pause|resume|stop|toggle)$/;
+
+        my $command = $a[2];
+        my $state = ReadingsVal($n, 'StopWatchState', '');
+        my %allowed = (
+            start  => 'Off',
+            pause  => 'Running',
+            resume => 'Paused',
+        );
+        if (exists $allowed{$command}) {
+            return "StopWatchState ist nicht bekannt; zuerst Status empfangen oder 'stopwatch toggle' verwenden."
+                if $state !~ /^(?:Off|Running|Paused)$/;
+            return "stopwatch $command nicht ausgefuehrt: StopWatchState=$state (erwartet $allowed{$command})."
+                if $state ne $allowed{$command};
+        }
+        # Stop is idempotent: Off needs no reset. Toggle deliberately has no guard.
+        return undef if $command eq 'stop' && $state eq 'Off';
+
+        my $reset = $command eq 'stop';
+        my $feature = $reset
+            ? 'BSH.Common.Command.StopWatchReset'
+            : 'BSH.Common.Command.StopWatchStartPauseResume';
+        my $uid_hex = $reset ? '023E' : '023D';
+        if (ref($hash->{Mapping}) eq 'HASH'
+            && ref($hash->{Mapping}{UIDByFeature}) eq 'HASH') {
+            my $mapped = $hash->{Mapping}{UIDByFeature}{$feature};
+            $uid_hex = $mapped if defined($mapped) && $mapped =~ /^[0-9A-Fa-f]+$/;
+        }
+        my $uid = hex($uid_hex);
+        Log3 $n, 4, "HomeConnectLocal ($n) - STOPWATCH SEND v1.58: "
+            . "command=$command state=$state resource=/ro/values uid=$uid value=true";
+        my $sent = HomeConnectLocal_SendProtocol(
+            $hash, '/ro/values', 1, 'POST',
+            { uid => $uid, value => JSON::PP::true }
+        );
+        return $sent ? undef : 'Stoppuhr-Befehl konnte nicht gesendet werden.';
+    }
 
     # v20: private command used by HomeConnectLocal.js. It is intentionally
     # omitted from SetList so normal FHEMWEB users do not see an implementation
@@ -6222,6 +6834,21 @@ sub HomeConnectLocal_Set {
             $p->{name},
             1
         );
+
+        # Oven: keep the preparation context in readings as well as in the
+        # transient hash.  This survives runtime metadata refreshes and a FHEM
+        # restart between "prepare" and "start".  A newly selected program
+        # deliberately starts with an empty option set, so values from an older
+        # program can never leak into it.
+        if (lc(AttrVal($n, 'deviceType', '')) eq 'oven') {
+            HomeConnectLocal_ReadingsSingleUpdate(
+                $hash, 'preparedProgram', $p->{name}, 1
+            );
+            HomeConnectLocal_ReadingsSingleUpdate(
+                $hash, 'preparedOptions', '{}', 1
+            );
+            Log3 $n, 5, "HomeConnectLocal ($n) - OVEN PREPARED RESET: program=$p->{name}";
+        }
 
         return undef;
     }
@@ -6319,6 +6946,13 @@ sub HomeConnectLocal_Set {
                 if defined($e->{min}) && $num < $e->{min};
             return "Wert fuer '$option_name' ist zu gross (max=$e->{max})."
                 if defined($e->{max}) && $num > $e->{max};
+            if (defined($e->{stepSize}) && $e->{stepSize} > 0
+                && defined($e->{min})) {
+                my $steps = ($num - $e->{min}) / $e->{stepSize};
+                my $nearest = int($steps + ($steps >= 0 ? 0.5 : -0.5));
+                return "Ungueltige Schrittweite fuer '$option_name' (stepSize=$e->{stepSize})."
+                    if abs($steps - $nearest) > 1e-9;
+            }
             $value = $num;
             $display = $input;
         }
@@ -6336,6 +6970,22 @@ sub HomeConnectLocal_Set {
             $hash, 'option_' . $option_name,
             defined($display) ? $display : $input, 1
         );
+
+        if (lc(AttrVal($n, 'deviceType', '')) eq 'oven') {
+            my %prepared;
+            for my $pu (sort keys %{ $hash->{HC_SELECTED_PROGRAM_OPTIONS} || {} }) {
+                my $po = $hash->{HC_SELECTED_PROGRAM_OPTIONS}{$pu};
+                next if ref($po) ne 'HASH' || !exists($po->{value});
+                $prepared{HomeConnectLocal_NormalizeHex($pu)} = $po->{value};
+            }
+            HomeConnectLocal_ReadingsSingleUpdate(
+                $hash, 'preparedProgram', $p->{name}, 1
+            );
+            HomeConnectLocal_ReadingsSingleUpdate(
+                $hash, 'preparedOptions', encode_json(\%prepared), 1
+            );
+            Log3 $n, 5, "HomeConnectLocal ($n) - OVEN PREPARED SAVE: " . encode_json(\%prepared);
+        }
 
         my @options;
         for my $ouid (sort keys %{ $hash->{HC_SELECTED_PROGRAM_OPTIONS} }) {
@@ -6418,6 +7068,18 @@ sub HomeConnectLocal_Set {
                 $on ? "on" : "off",
                 1
             );
+            if (lc(AttrVal($n, 'deviceType', '')) eq 'oven') {
+                my %prepared;
+                for my $uid (keys %{ $hash->{HC_SELECTED_PROGRAM_OPTIONS} || {} }) {
+                    my $entry = $hash->{HC_SELECTED_PROGRAM_OPTIONS}{$uid};
+                    next if ref($entry) ne 'HASH' || !exists($entry->{value});
+                    $prepared{HomeConnectLocal_NormalizeHex($uid)} = $entry->{value};
+                }
+                HomeConnectLocal_ReadingsSingleUpdate($hash, 'preparedProgram', $p->{name}, 1);
+                HomeConnectLocal_ReadingsSingleUpdate($hash, 'preparedOptions', encode_json(\%prepared), 1);
+                Log3 $n, 5, "HomeConnectLocal ($n) - OVEN PREPARED SAVE: " . encode_json(\%prepared);
+            }
+
 
             my @options;
             my %allowed_now = map { $_ => 1 } @{ $p->{optionUIDs} || [] };
@@ -6507,8 +7169,13 @@ sub HomeConnectLocal_Set {
         my $input = $a[2];
 
         my $access = $e->{access} // '';
-        return "Setting '$setting_name' ist nicht schreibbar (access=$access)."
-            if $access !~ /^(?:readWrite|writeOnly)$/;
+        if ($access !~ /^(?:readWrite|writeOnly)$/) {
+            if ($setting_name eq 'ChildLock'
+                && lc(ReadingsVal($n, 'OperationState', '')) eq 'inactive') {
+                return "ChildLock nicht verfuegbar wenn OperationState=Inactive.";
+            }
+            return "Setting '$setting_name' ist nicht schreibbar (access=$access).";
+        }
         return "Setting '$setting_name' ist laut XML nicht verfuegbar."
             if defined($e->{available}) && "$e->{available}" eq 'false';
 
@@ -6581,6 +7248,34 @@ sub HomeConnectLocal_Set {
         }
 
         my $protocol_uid = hex($uid);
+
+        # Oven ChildLock is explicitly unavailable in some operation states.
+        # Only block when the live runtime metadata unambiguously says so;
+        # unknown availability keeps the previous behaviour.
+        if (lc(AttrVal($n, 'deviceType', '')) eq 'oven'
+            && ($e->{feature} // '') eq 'BSH.Common.Setting.ChildLock') {
+            my $runtime = $hash->{RuntimeMeta}{sprintf('%04X', $protocol_uid)};
+            if (ref($runtime) eq 'HASH') {
+                my @availability;
+                for my $parent (values %{ $runtime->{parents} || {} }) {
+                    push @availability, $parent->{available}
+                        if ref($parent) eq 'HASH' && defined($parent->{available});
+                }
+                if (ref($runtime->{global}) eq 'HASH'
+                    && defined($runtime->{global}{available})) {
+                    push @availability, $runtime->{global}{available};
+                }
+                if (@availability
+                    && !grep { "$_" =~ /^(?:1|true|yes)$/i } @availability
+                    && grep { "$_" =~ /^(?:0|false|no)$/i } @availability) {
+                    Log3 $n, 4, "HomeConnectLocal ($n) - ChildLock: runtime available=0, POST unterdrueckt";
+                    my $op = ReadingsVal($n, 'OperationState', '');
+                    return "ChildLock nicht verfuegbar wenn OperationState=Inactive."
+                        if lc($op) eq 'inactive';
+                    return "ChildLock derzeit nicht verfuegbar.";
+                }
+            }
+        }
 
         Log3 $n, 5,
             "HomeConnectLocal ($n) - SETTING SEND: resource=/ro/values action=POST "
@@ -6691,6 +7386,8 @@ sub HomeConnectLocal_Set {
         # reports that remote starting is currently allowed.
         my $remote_start = ReadingsVal($n, "RemoteControlStartAllowed", "");
         if (lc($remote_start) ne "true") {
+            return "Programmstart nicht verfuegbar wenn OperationState=Inactive."
+                if lc(ReadingsVal($n, 'OperationState', '')) eq 'inactive';
             Log3 $n, 5,
                 "HomeConnectLocal ($n) - START BLOCKED: "
               . "RemoteControlStartAllowed='$remote_start'";
@@ -6699,18 +7396,37 @@ sub HomeConnectLocal_Set {
                  . ".";
         }
 
+        # On the tested oven, remote-start flags can remain true while
+        # OperationState=Inactive; the device rejects the POST with code 516.
+        if (lc(AttrVal($n, 'deviceType', '')) eq 'oven'
+            && lc(ReadingsVal($n, 'OperationState', '')) eq 'inactive') {
+            Log3 $n, 4, "HomeConnectLocal ($n) - START BLOCKED: OperationState=Inactive";
+            return "Programmstart nicht verfuegbar wenn OperationState=Inactive.";
+        }
+
         my $active = HomeConnectLocal_FindProgramRoot($hash, 'activeProgram');
         return "ActiveProgram wurde im XML-Mapping nicht gefunden."
             if !defined($active);
 
-        # Prefer the value reported by the appliance.  The mapped parser
-        # normally exposes BSH.Common.Root.SelectedProgram as SelectedProgram.
-        my $selected_name = ReadingsVal($n, "SelectedProgram", "");
-        $selected_name = ReadingsVal($n, "selectedProgramCandidate", "")
-            if $selected_name eq "";
+        # For ovens, the explicitly prepared FHEM context is authoritative.
+        # SelectedProgram is still used as fallback, but it may be 0 or may
+        # change independently of the preparation workflow.
+        my $dtype = lc(AttrVal($n, 'deviceType', ''));
+        my $selected_name;
+        if ($dtype eq 'oven') {
+            $selected_name = ReadingsVal($n, 'preparedProgram', '');
+            $selected_name = ReadingsVal($n, 'selectedProgramCandidate', '')
+                if $selected_name eq '' || $selected_name eq '0';
+            $selected_name = ReadingsVal($n, 'SelectedProgram', '')
+                if $selected_name eq '' || $selected_name eq '0';
+        } else {
+            $selected_name = ReadingsVal($n, "SelectedProgram", "");
+            $selected_name = ReadingsVal($n, "selectedProgramCandidate", "")
+                if $selected_name eq "";
+        }
 
         return "Kein Programm ausgewaehlt. Bitte zuerst 'set $n program <Programm>' verwenden."
-            if $selected_name eq "";
+            if $selected_name eq "" || $selected_name eq "0";
 
         my $p = HomeConnectLocal_FindProgram($hash, $selected_name);
 
@@ -6729,25 +7445,59 @@ sub HomeConnectLocal_Set {
         return "Ausgewaehltes Programm '$selected_name' konnte nicht der XML-Programmliste zugeordnet werden."
             if !defined($p);
 
+        # Oven cleaning is intentionally not sent through the generic heating
+        # start path until its local protocol behaviour has been validated.
+        if (lc(AttrVal($n, 'deviceType', '')) eq 'oven'
+            && ($p->{name} // '') eq 'Pyrolysis') {
+            return "Pyrolyse wird aus Sicherheitsgruenden noch nicht remote gestartet.";
+        }
+
         my $program_uid = hex($p->{uid});
         my $payload = {
             program => 0 + $program_uid
         };
 
         my @options;
-        my %allowed = map { $_ => 1 } @{ $p->{optionUIDs} || [] };
+        my %allowed = map { HomeConnectLocal_NormalizeHex($_) => 1 }
+                      @{ $p->{optionUIDs} || [] };
+
         if (ref($hash->{HC_SELECTED_PROGRAM_OPTIONS}) eq 'HASH') {
             for my $ouid (sort keys %{ $hash->{HC_SELECTED_PROGRAM_OPTIONS} }) {
-                next if !$allowed{$ouid};
+                my $nu = HomeConnectLocal_NormalizeHex($ouid);
+                next if !$allowed{$nu};
                 my $oe = $hash->{HC_SELECTED_PROGRAM_OPTIONS}{$ouid};
-                next if ref($oe) ne 'HASH';
-
-                push @options, {
-                    uid   => 0 + hex($ouid),
-                    value => $oe->{value}
-                };
+                next if ref($oe) ne 'HASH' || !exists($oe->{value});
+                push @options, { uid => 0 + hex($nu), value => $oe->{value} };
             }
         }
+
+        # Oven fallback: restore exactly the options that belonged to the
+        # prepared program.  preparedOptions is reset whenever "set program"
+        # selects another program, so stale option_* readings are not scanned
+        # or reused.
+        if ($dtype eq 'oven' && !@options) {
+            my $prepared_program = ReadingsVal($n, 'preparedProgram', '');
+            my $json = ReadingsVal($n, 'preparedOptions', '{}');
+            if ($prepared_program eq ($p->{name} // '') && $json ne '') {
+                my $saved;
+                eval { $saved = decode_json($json); 1 };
+                if (ref($saved) eq 'HASH') {
+                    for my $ouid (sort keys %$saved) {
+                        my $nu = HomeConnectLocal_NormalizeHex($ouid);
+                        next if !$allowed{$nu};
+                        push @options, {
+                            uid   => 0 + hex($nu),
+                            value => $saved->{$ouid}
+                        };
+                        Log3 $n, 5,
+                            "HomeConnectLocal ($n) - OVEN START RESTORE: "
+                          . "program='$p->{name}' xmlOptionUID=$nu "
+                          . "value='" . $saved->{$ouid} . "'";
+                    }
+                }
+            }
+        }
+
         $payload->{options} = \@options if @options;
 
         Log3 $n, 5,
@@ -6755,6 +7505,12 @@ sub HomeConnectLocal_Set {
           . "resource=/ro/activeProgram action=POST "
           . "program='$p->{name}' xmlProgramUID=$p->{uid} "
           . "protocolValue=$program_uid data=" . encode_json($payload);
+
+        Log3 $n, 3, "HomeConnectLocal ($n) - OVEN START JSON TEST v1.59: "
+            . "mode=" . ($dtype eq 'oven'
+                ? AttrVal($n, 'programStartJsonMode', 'ordered') : 'normal')
+            . " program='$p->{name}' options=" . scalar(@options)
+            if $dtype eq 'oven';
 
         my $sent = HomeConnectLocal_SendProtocol(
             $hash,
@@ -6899,7 +7655,8 @@ sub HomeConnectLocal_Get {
                 next if $sn eq '' || $seen{$sn}++;
                 # v22: the preparation wizard is for actual programme parameters.
                 # Scheduling/meta options stay available through normal FHEM sets.
-                next if $sn eq 'FinishInRelative' || $sn eq 'Duration';
+                next if $sn eq 'FinishInRelative';
+                next if $sn eq 'Duration' && lc(AttrVal($n, 'deviceType', '')) ne 'oven';
 
                 my $acc = lc($e->{access} // '');
                 # v33: WasherDryer exposes a dedicated live writable option
@@ -6912,8 +7669,13 @@ sub HomeConnectLocal_Get {
                 # declaration. Do not hide those options from the popup merely
                 # because runtimeLiveContext is absent.
                 my $dtype = lc(AttrVal($n, 'deviceType', ''));
-                my $is_dishwasher = ($dtype eq 'dishwasher') ? 1 : 0;
-                if (!$is_dishwasher) {
+                # Dishwasher and Oven declare their writable preparation
+                # options primarily on the concrete program in the XML.
+                # They do not necessarily expose a separate writable live
+                # option container like WasherDryer does.
+                my $static_program_options_ok =
+                    ($dtype eq 'dishwasher' || $dtype eq 'oven') ? 1 : 0;
+                if (!$static_program_options_ok) {
                     next if !$e->{runtimeLiveContext};
                     next if $acc !~ /^(?:readwrite|writeonly)$/;
                     next if defined($e->{available}) && lc("$e->{available}") eq 'false';
@@ -6942,6 +7704,12 @@ sub HomeConnectLocal_Get {
                     $o{min} = 0 + $e->{min};
                     $o{max} = 0 + $e->{max};
                     $o{step} = defined($e->{stepSize}) ? 0 + $e->{stepSize} : 1;
+                    $o{default} = 0 + $e->{default}
+                        if defined($e->{default}) && $e->{default} =~ /^-?(?:\d+(?:\.\d*)?|\.\d+)$/;
+                    if (lc(AttrVal($n, 'deviceType', '')) eq 'oven') {
+                        $o{unit} = '°C' if $sn eq 'SetpointTemperature';
+                        $o{unit} = 's'  if $sn eq 'Duration' || $sn eq 'StartInRelative';
+                    }
                 }
                 else { next; }
 
@@ -7412,7 +8180,7 @@ sub HomeConnectLocal_Attr {
     <li><code>encryptionKey &lt;key&gt;</code> &ndash; appliance pairing/encryption key. Treat as confidential.</li>
     <li><code>connectionType TLS|AES</code> &ndash; local protocol connection type.</li>
     <li><code>iv &lt;value&gt;</code> &ndash; initialization-vector configuration where required by the selected connection type.</li>
-    <li><code>deviceType dishwasher|hob|washer|washerdryer</code> &ndash; appliance class used for mapping selection and display logic.</li>
+    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer</code> &ndash; appliance class used for mapping selection and display logic.</li>
     <li><code>mappingDir &lt;directory&gt;</code> &ndash; directory containing XML mapping files. Default: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
     <li><code>mappingPrefix &lt;prefix&gt;</code> &ndash; explicitly select a mapping file pair by prefix.</li>
     <li><code>excludeReadings &lt;patterns&gt;</code> &ndash; hide/delete unwanted readings. Wildcards <code>*</code> and <code>?</code> are supported.</li>
@@ -7496,7 +8264,7 @@ sub HomeConnectLocal_Attr {
     <li><code>encryptionKey &lt;Schl&uuml;ssel&gt;</code> &ndash; Pairing-/Verschl&uuml;sselungsschl&uuml;ssel des Hausger&auml;ts. Vertraulich behandeln.</li>
     <li><code>connectionType TLS|AES</code> &ndash; verwendete lokale Protokollverbindung.</li>
     <li><code>iv &lt;Wert&gt;</code> &ndash; Initialisierungsvektor, sofern f&uuml;r die gew&auml;hlte Verbindungsart erforderlich.</li>
-    <li><code>deviceType dishwasher|hob|washer|washerdryer</code> &ndash; Ger&auml;teklasse f&uuml;r Mappingauswahl und Darstellungslogik.</li>
+    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer</code> &ndash; Ger&auml;teklasse f&uuml;r Mappingauswahl und Darstellungslogik.</li>
     <li><code>mappingDir &lt;Verzeichnis&gt;</code> &ndash; Verzeichnis der XML-Mappingdateien. Standard: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
     <li><code>mappingPrefix &lt;Pr&auml;fix&gt;</code> &ndash; ein bestimmtes Mapping-Dateipaar anhand seines Pr&auml;fixes ausw&auml;hlen.</li>
     <li><code>excludeReadings &lt;Muster&gt;</code> &ndash; nicht ben&ouml;tigte Readings ausblenden/l&ouml;schen. Wildcards <code>*</code> und <code>?</code> werden unterst&uuml;tzt.</li>
