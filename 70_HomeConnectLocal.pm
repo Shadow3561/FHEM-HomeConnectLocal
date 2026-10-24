@@ -70,11 +70,19 @@
 #  1.38      LastSetList Internal formatted with line breaks for FHEMWEB
 #  1.39      LastSetList uses real newlines; long enum/program entries wrap at commas
 #  1.40      Hob SetList restricted to a conservative whitelist of safe settings
+#  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
 #  1.42      Oven deviceType, oven program popup/options and guarded Pyrolysis start
 #  1.43      Oven prepared-program context persists program/options in readings and start restores them
 #  1.59-4    IPv6/FQDN proxy support from v1.61; guard unavailable oven ChildLock
 #  1.59-3    Oven AlarmClock in SetList; clear stale protocol_error after successful RO response
-#  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
+#  1.59-5    Further oven support and runtime handling improvements
+#  1.59-6    Improved oven command availability checks and error messages
+#  1.59-7    Automatic IPv6 Link-Local interface scope detection
+#            for addresses without an explicit %interface.
+#            Supports TLS-PSK (port 443) and AES (port 80).
+#            Detected scope is cached for reconnects.
+#            IPv4, FQDN, IPv6-ULA and explicitly scoped IPv6
+#            connections remain unchanged.
 #
 ########################################################################################
 
