@@ -8,7 +8,7 @@ HomeConnectLocal bindet kompatible Home-Connect-Hausgeräte **direkt über das l
 
 ## Unterstützte Geräte (1.59-7)
 
-| Gerätetyp | `deviceType` |
+| Gerätetyp | `deviceType` | aktueller Status |
 | --- | --- |
 | Geschirrspüler | `dishwasher` | getestet |
 | Kochfeld | `hob` | getestet |
