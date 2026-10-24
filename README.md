@@ -14,7 +14,7 @@ HomeConnectLocal bindet kompatible Home-Connect-Hausgeräte **direkt über das l
 | Kochfeld | `hob` | getestet |
 | Waschmaschine | `washer` | experimentell |
 | Waschtrockner | `washerdryer` | getestet |
-| Trockner | `washerdryer` | experimentell |
+| Trockner | `dryer` | experimentell |
 | Backofen | `oven` | getestet |
 
 Welche Funktionen tatsächlich verfügbar sind, hängt von Modell, XML-Mapping und den zur Laufzeit vom Gerät gemeldeten Berechtigungen ab. **Kühl-/Gefriergeräte sind erst Gegenstand der noch ungetesteten Entwicklungsversion 1.60-0.**
