@@ -10,11 +10,12 @@ HomeConnectLocal bindet kompatible Home-Connect-Hausgeräte **direkt über das l
 
 | Gerätetyp | `deviceType` |
 | --- | --- |
-| Geschirrspüler | `dishwasher` |
-| Kochfeld | `hob` |
-| Waschmaschine | `washer` |
-| Waschtrockner | `washerdryer` |
-| Backofen | `oven` |
+| Geschirrspüler | `dishwasher` | getestet |
+| Kochfeld | `hob` | getestet |
+| Waschmaschine | `washer` | experimentell |
+| Waschtrockner | `washerdryer` | getestet |
+| Trockner | `washerdryer` | experimentell |
+| Backofen | `oven` | getestet |
 
 Welche Funktionen tatsächlich verfügbar sind, hängt von Modell, XML-Mapping und den zur Laufzeit vom Gerät gemeldeten Berechtigungen ab. **Kühl-/Gefriergeräte sind erst Gegenstand der noch ungetesteten Entwicklungsversion 1.60-0.**
 
@@ -31,7 +32,7 @@ Welche Funktionen tatsächlich verfügbar sind, hängt von Modell, XML-Mapping u
 
 ## Voraussetzungen
 
-- Laufende FHEM-Installation mit Netzwerkzugriff auf das Hausgerät.
+- Laufende FHEM-Installation mit Netzwerkzugriff auf das Hausgerät. Das Hausgerät aus in der Homeconnect-App eingerichtet sein.
 - Perl-Module: `JSON::PP`, `IO::Socket::INET`, `IO::Socket::IP`, `MIME::Base64`, `Digest::SHA`, `Crypt::Mode::CBC` und `Encode`.
 - Zum Gerät passende **Pairing-/Verschlüsselungsdaten** und das **XML-Dateipaar** `*_DeviceDescription.xml` / `*_FeatureMapping.xml`.
 - Das zur Beschaffung dieser gerätespezifischen Dateien erforderliche **separate Download-/Extraktionsprogramm** (siehe nächsten Abschnitt). Die XML-Dateien werden nicht automatisch vom FHEM-Modul heruntergeladen.
