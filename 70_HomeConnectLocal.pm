@@ -9,13 +9,13 @@
 #    - Dishwasher
 #    - Hob
 #    - Washer / WasherDryer
-#    - Oven
+#    - Refrigerator / Freezer
 #
 #  Device capabilities, programs, settings and options are loaded dynamically
 #  from external Home Connect DeviceDescription and FeatureMapping XML files.
 #
-#  Version 1.59-7, 22.10.2026
-#  $Id: 70_HomeConnectLocal.pm 1.59-7 2026-10-22 $
+#  Version 1.70, 01.11.2026
+#  $Id: 70_HomeConnectLocal.pm 1.70 2026-11-01 $
 #
 ########################################################################################
 #
@@ -70,19 +70,22 @@
 #  1.38      LastSetList Internal formatted with line breaks for FHEMWEB
 #  1.39      LastSetList uses real newlines; long enum/program entries wrap at commas
 #  1.40      Hob SetList restricted to a conservative whitelist of safe settings
-#  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
 #  1.42      Oven deviceType, oven program popup/options and guarded Pyrolysis start
 #  1.43      Oven prepared-program context persists program/options in readings and start restores them
-#  1.59-4    IPv6/FQDN proxy support from v1.61; guard unavailable oven ChildLock
+#  1.41      Active WebSocket heartbeat: client PING every 20 s, PONG timeout/reconnect
 #  1.59-3    Oven AlarmClock in SetList; clear stale protocol_error after successful RO response
-#  1.59-5    Further oven support and runtime handling improvements
-#  1.59-6    Improved oven command availability checks and error messages
-#  1.59-7    Automatic IPv6 Link-Local interface scope detection
-#            for addresses without an explicit %interface.
-#            Supports TLS-PSK (port 443) and AES (port 80).
-#            Detected scope is cached for reconnects.
-#            IPv4, FQDN, IPv6-ULA and explicitly scoped IPv6
-#            connections remain unchanged.
+#  1.59-4    IPv6/FQDN proxy support; guard unavailable oven ChildLock
+#  1.60-0    Refrigerator/freezer notification handling
+#  1.60-1    Refrigerator/freezer reading diagnostics
+#  1.60-2    Refrigerator/freezer SET commands independent of program list;
+#            core refrigerator/freezer functions confirmed by external tester
+#  1.60-3    Translate reading VALUES in place (DE/EN) without changing reading names;
+#            extend fridge/freezer status value dictionary; SET/protocol unchanged
+#  1.60-4    AES initialization: set waiting states before sending requests
+#            to avoid overwriting a fast connected RESPONSE
+#  1.70      Optional proxyLog normal|quiet for TLS socat/openssl stderr;
+#            TCP/TLS channel-active message moved to verbose level 3
+
 #
 ########################################################################################
 
@@ -108,7 +111,7 @@ use Encode qw(decode FB_CROAK);
 my %HomeConnectLocal_Private;
 
 # Central module version. Also exposed in each device as MODULE_VERSION.
-my $HomeConnectLocal_VERSION = '1.59-7';
+my $HomeConnectLocal_VERSION = '1.70';
 
 
 ##############################################
@@ -136,8 +139,9 @@ sub HomeConnectLocal_Initialize {
           "disable:0,1 "
         . "encryptionKey "
         . "connectionType:TLS,AES "
+        . "proxyLog:normal,quiet "
         . "iv "
-        . "deviceType:dishwasher,hob,oven,washer,washerdryer "
+        . "deviceType:dishwasher,hob,oven,washer,washerdryer,fridgefreezer "
         . "mappingDir "
         . "mappingPrefix "
         . "excludeReadings "
@@ -1346,6 +1350,16 @@ sub HomeConnectLocal_BuildSetMap {
         }
     }
 
+    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'fridgefreezer') {
+        for my $sn (sort keys %setmap) {
+            my $e = $setmap{$sn};
+            next if ref($e) ne 'HASH';
+            Log3 $hash->{NAME}, 5,
+                "HomeConnectLocal ($hash->{NAME}) - FRIDGE SETMAP: name=$sn kind="
+                . ($e->{kind} // '-') . " access=" . ($e->{access} // '-')
+                . " available=" . ($e->{available} // '-');
+        }
+    }
     $hash->{HC_SETMAP} = \%setmap;
     $hash->{HC_OPTION_BY_UID} = \%option_by_uid;
     $hash->{HC_OPTION_BY_NAME} = \%option_by_name;
@@ -1725,56 +1739,58 @@ sub HomeConnectLocal_SetList {
         push @list, 'stop:noArg';
         push @list, 'power:on,off' if !$menu_running;
 
-        # Writable XML settings become direct FHEM SET commands.
-        # This gives FHEMWEB a normal two-level command/value dropdown.
-        if (!$menu_running && ref($hash->{HC_SETMAP}) eq 'HASH') {
-            for my $setting_name (sort keys %{ $hash->{HC_SETMAP} }) {
-                my $e = $hash->{HC_SETMAP}{$setting_name};
-                next if ref($e) ne 'HASH';
-                my $dsetting = HomeConnectLocal_SetDisplayToken($hash, 'option', $setting_name);
-                next if ($e->{kind} // '') ne 'setting';
-                next if lc($e->{access} // '') !~ /^(?:readwrite|writeonly)$/;
-                next if defined($e->{available}) && lc("$e->{available}") eq 'false';
-                next if $setting_name eq 'PowerState'; # handled by power:on,off
-                next if $setting_name eq 'AlarmClock' && lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'oven'; # exposed above even while running
-
-                my $enum_type = $e->{enumerationType};
-                if ((!defined($enum_type) || $enum_type eq '')
-                    && ref($hash->{Mapping}{EnumTypeByUID}) eq 'HASH') {
-                    $enum_type = $hash->{Mapping}{EnumTypeByUID}{$e->{uid}};
-                }
-
-                if (defined($enum_type) && $enum_type ne ''
-                    && ref($hash->{Mapping}{EnumValues}) eq 'HASH'
-                    && ref($hash->{Mapping}{EnumValues}{$enum_type}) eq 'HASH') {
-                    my $ev = $hash->{Mapping}{EnumValues}{$enum_type};
-                    my @values = map { $ev->{$_} }
-                        sort { $a <=> $b } grep { /^\d+$/ } keys %$ev;
-                    my @dvalues = map { HomeConnectLocal_SetDisplayToken($hash, 'value', $_) } @values;
-                    push @list, $dsetting . ':' . join(',', @dvalues)
-                        if @dvalues;
-                    next;
-                }
-
-                if (($e->{refCID} // '') eq '01'
-                    && ($e->{refDID} // '') eq '00') {
-                    push @list, $dsetting . ':' . join(',', map { HomeConnectLocal_SetDisplayToken($hash, 'value', $_) } qw(on off));
-                    next;
-                }
-
-                if (defined($e->{min}) && defined($e->{max})) {
-                    my $spec = 'slider,' . $e->{min} . ','
-                        . (defined($e->{stepSize}) ? $e->{stepSize} : 1)
-                        . ',' . $e->{max};
-                    push @list, $dsetting . ':' . $spec;
-                    next;
-                }
-            }
-        }
-
         push @list, 'pause:noArg' if $running;
         push @list, 'resume:noArg' if $running;
     }
+
+    # v1.60-2: XML settings are independent of HC_PROGRAMS (fridge/freezer).
+    # Writable XML settings become direct FHEM SET commands.
+    # This gives FHEMWEB a normal two-level command/value dropdown.
+    if (!$menu_running && ref($hash->{HC_SETMAP}) eq 'HASH') {
+        for my $setting_name (sort keys %{ $hash->{HC_SETMAP} }) {
+            my $e = $hash->{HC_SETMAP}{$setting_name};
+            next if ref($e) ne 'HASH';
+            my $dsetting = HomeConnectLocal_SetDisplayToken($hash, 'option', $setting_name);
+            next if ($e->{kind} // '') ne 'setting';
+            next if lc($e->{access} // '') !~ /^(?:readwrite|writeonly)$/;
+            next if defined($e->{available}) && lc("$e->{available}") eq 'false';
+            next if $setting_name eq 'PowerState'; # handled by power:on,off
+            next if $setting_name eq 'AlarmClock' && lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'oven'; # exposed above even while running
+
+            my $enum_type = $e->{enumerationType};
+            if ((!defined($enum_type) || $enum_type eq '')
+                && ref($hash->{Mapping}{EnumTypeByUID}) eq 'HASH') {
+                $enum_type = $hash->{Mapping}{EnumTypeByUID}{$e->{uid}};
+            }
+
+            if (defined($enum_type) && $enum_type ne ''
+                && ref($hash->{Mapping}{EnumValues}) eq 'HASH'
+                && ref($hash->{Mapping}{EnumValues}{$enum_type}) eq 'HASH') {
+                my $ev = $hash->{Mapping}{EnumValues}{$enum_type};
+                my @values = map { $ev->{$_} }
+                    sort { $a <=> $b } grep { /^\d+$/ } keys %$ev;
+                my @dvalues = map { HomeConnectLocal_SetDisplayToken($hash, 'value', $_) } @values;
+                push @list, $dsetting . ':' . join(',', @dvalues)
+                    if @dvalues;
+                next;
+            }
+
+            if (($e->{refCID} // '') eq '01'
+                && ($e->{refDID} // '') eq '00') {
+                push @list, $dsetting . ':' . join(',', map { HomeConnectLocal_SetDisplayToken($hash, 'value', $_) } qw(on off));
+                next;
+            }
+
+            if (defined($e->{min}) && defined($e->{max})) {
+                my $spec = 'slider,' . $e->{min} . ','
+                    . (defined($e->{stepSize}) ? $e->{stepSize} : 1)
+                    . ',' . $e->{max};
+                push @list, $dsetting . ':' . $spec;
+                next;
+            }
+        }
+    }
+
 
     # excludeSets only changes the visible FHEMWEB SetList.  The command
     # handler itself remains available for manual/automation calls.
@@ -2234,6 +2250,15 @@ sub HomeConnectLocal_UpdateMappedValue {
         $mv,
         1
     );
+
+    # v1.60-1: Read-only refrigerator diagnostics (verbose 5).
+    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'fridgefreezer') {
+        my $stored = exists($hash->{READINGS}{$r})
+            ? $hash->{READINGS}{$r}{VAL} : '<missing>';
+        Log3 $hash->{NAME}, 5,
+            "HomeConnectLocal ($hash->{NAME}) - FRIDGE VALUE MAP: uid=$uid feature=$f reading=$r mapped=$mv stored=$stored";
+    }
+
 
     # v1.55: Track stopwatch status when operated directly on the appliance
     # or through the official app. These are read-only diagnostics.
@@ -3327,6 +3352,9 @@ sub HomeConnectLocal_Connect {
     # The surrounding shell single quotes preserve these backslashes.
     $tls_host =~ s/:/\\:/g if $tls_host =~ /:/;
 
+    my $proxy_log = AttrVal($name, "proxyLog", "normal");
+    my $proxy_stderr = $proxy_log eq "quiet" ? " 2>/dev/null" : "";
+
     my $cmd =
           "socat "
         . "TCP-LISTEN:$lp,reuseaddr,fork "
@@ -3337,7 +3365,9 @@ sub HomeConnectLocal_Connect {
         . "-noservername "
         . "-cipher ECDHE-PSK-CHACHA20-POLY1305 "
         . "-quiet "
-        . "-ign_eof',nofork &";
+        . "-ign_eof',nofork"
+        . $proxy_stderr
+        . " &";
 
     system($cmd);
 
@@ -3379,7 +3409,7 @@ sub HomeConnectLocal_Connect {
             $main::selectlist{$name} =
                 $hash;
 
-            Log3 $name, 2,
+            Log3 $name, 3,
                 "HomeConnectLocal ($name) - "
                 . "TCP/TLS Kanal aktiv.";
 
@@ -4857,6 +4887,16 @@ sub HomeConnectLocal_InitialHandshake {
             . "msgID=$mid";
 
 
+        # Wartezustand VOR dem Senden setzen: eine schnelle RESPONSE darf
+        # nicht nachtraeglich wieder durch 'waiting' ueberschrieben werden.
+        HomeConnectLocal_ReadingsSingleUpdate(
+            $hash,
+            "state",
+            "aes_wait_description_changes",
+            1
+        );
+
+
         my $ok =
             HomeConnectLocal_SendRaw(
                 $hash,
@@ -4884,14 +4924,6 @@ sub HomeConnectLocal_InitialHandshake {
 
         $hash->{TxMsgID} =
             $mid + 1;
-
-
-        HomeConnectLocal_ReadingsSingleUpdate(
-            $hash,
-            "state",
-            "aes_wait_description_changes",
-            1
-        );
 
 
         return;
@@ -4950,6 +4982,16 @@ sub HomeConnectLocal_InitialHandshake {
             . "msgID=$mid";
 
 
+        # Wartezustand VOR dem Senden setzen: eine schnelle RESPONSE darf
+        # nicht nachtraeglich wieder durch 'waiting' ueberschrieben werden.
+        HomeConnectLocal_ReadingsSingleUpdate(
+            $hash,
+            "state",
+            "aes_wait_mandatory_values",
+            1
+        );
+
+
         my $ok =
             HomeConnectLocal_SendRaw(
                 $hash,
@@ -4970,14 +5012,6 @@ sub HomeConnectLocal_InitialHandshake {
 
         $hash->{TxMsgID} =
             $mid + 1;
-
-
-        HomeConnectLocal_ReadingsSingleUpdate(
-            $hash,
-            "state",
-            "aes_wait_mandatory_values",
-            1
-        );
 
 
         return;
@@ -5408,11 +5442,41 @@ sub HomeConnectLocal_ProcessPayload {
         Log3 $n, 5, "HomeConnectLocal ($n) - RO RX DIAGNOSTIC: " . encode_json($d);
     }
 
+    # v1.60-1: Log the actual description-change payload before parsing.
+    # Fridge only; this diagnostic can include device metadata.
+    if (($d->{action} // '') eq 'NOTIFY'
+        && ($d->{resource} // '') eq '/ro/descriptionChange'
+        && lc(AttrVal($n, 'deviceType', '')) eq 'fridgefreezer') {
+        Log3 $n, 5, "HomeConnectLocal ($n) - FRIDGE DESCRIPTION RAW: " . encode_json($d);
+        if (ref($d->{data}) eq 'ARRAY') {
+            for my $item (@{ $d->{data} }) {
+                next if ref($item) ne 'HASH';
+                Log3 $n, 5, "HomeConnectLocal ($n) - FRIDGE DESCRIPTION ITEM: uid="
+                    . (defined($item->{uid}) ? $item->{uid} : '<missing>')
+                    . " value_present=" . (exists($item->{value}) ? 'yes' : 'no');
+            }
+        }
+    }
+
     if (($d->{action} // '') eq 'NOTIFY'
         && ($d->{resource} // '') eq '/ro/descriptionChange') {
         HomeConnectLocal_ParseDescriptionChanges($hash, $d);
         HomeConnectLocal_BuildSetMap($hash);
-        Log3 $n, 4, "HomeConnectLocal ($n) - LIVE DESCRIPTION CHANGE verarbeitet";
+
+        # v1.60-0: /ro/descriptionChange may contain actual appliance values
+        # (e.g. FridgeFreezer door UID 0x1001), not only capability metadata.
+        # Update those readings explicitly while keeping the early return:
+        # the message must not enter the generic protocol/handshake path.
+        my $updated = 0;
+        if (ref($d->{data}) eq 'ARRAY') {
+            for my $item (@{ $d->{data} }) {
+                next if ref($item) ne 'HASH';
+                next if !defined($item->{uid}) || !exists($item->{value});
+                HomeConnectLocal_UpdateMappedValue($hash, $item->{uid}, $item->{value});
+                $updated++;
+            }
+        }
+        Log3 $n, 4, "HomeConnectLocal ($n) - LIVE DESCRIPTION CHANGE verarbeitet (Werte=$updated)";
         return;
     }
 
@@ -7918,56 +7982,53 @@ sub HomeConnectLocal_ReadingExcluded {
 }
 
 
+# Translate only the value, never the reading name. The raw protocol
+# and SET command tokens are not changed by this presentation step.
 sub HomeConnectLocal_TranslatedReading {
     my ($hash, $reading, $value) = @_;
-    return if !$hash || !defined($reading) || !defined($value);
-    return if $reading =~ /_(?:DE|EN)$/;
+    return $value if !$hash || !defined($reading) || !defined($value);
+    return $value if $reading =~ /_(?:DE|EN)$/;
 
     my $mode = uc(AttrVal($hash->{NAME}, 'translation', 'off') // 'off');
-    return if $mode ne 'DE' && $mode ne 'EN';
-    return if !HomeConnectLocal_LoadTranslation($hash);
-    return if !defined(&HomeConnectLocal_TranslateReadingValue);
+    return $value if $mode ne 'DE' && $mode ne 'EN';
+    return $value if !HomeConnectLocal_LoadTranslation($hash);
+    return $value if !defined(&HomeConnectLocal_TranslateReadingValue);
 
     my $dtype = lc(AttrVal($hash->{NAME}, 'deviceType', ''));
     my $translated = HomeConnectLocal_TranslateReadingValue($mode, $dtype, $reading, $value);
-    return if !defined($translated) || $translated eq '' || "$translated" eq "$value";
-
-    return ($reading . '_' . $mode, $translated);
+    return defined($translated) && $translated ne '' ? $translated : $value;
 }
 
 sub HomeConnectLocal_ReadingsSingleUpdate {
     my ($hash, $reading, $value, $trigger) = @_;
 
+    if (lc(AttrVal($hash->{NAME}, 'deviceType', '')) eq 'fridgefreezer') {
+        my $raw_hidden = HomeConnectLocal_RawReadingHidden($hash, $reading);
+        my $excluded = HomeConnectLocal_ReadingExcluded($hash, $reading);
+        Log3 $hash->{NAME}, 5,
+            "HomeConnectLocal ($hash->{NAME}) - FRIDGE READING WRITE: reading=$reading raw_hidden=$raw_hidden excluded=$excluded";
+    }
     return if HomeConnectLocal_RawReadingHidden($hash, $reading);
     return if HomeConnectLocal_ReadingExcluded($hash, $reading);
 
-    my $ret = readingsSingleUpdate($hash, $reading, $value, $trigger);
-    my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
-    if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
-        readingsSingleUpdate($hash, $tr, $tv, $trigger);
-    }
-    return $ret;
+    return readingsSingleUpdate($hash, $reading,
+        HomeConnectLocal_TranslatedReading($hash, $reading, $value), $trigger);
 }
 
 sub HomeConnectLocal_ReadingsBulkUpdate {
     my ($hash, $reading, $value, @rest) = @_;
-
     return if HomeConnectLocal_RawReadingHidden($hash, $reading);
     return if HomeConnectLocal_ReadingExcluded($hash, $reading);
 
-    my $ret = readingsBulkUpdate($hash, $reading, $value, @rest);
-    my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
-    if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
-        readingsBulkUpdate($hash, $tr, $tv, @rest);
-    }
-    return $ret;
+    return readingsBulkUpdate($hash, $reading,
+        HomeConnectLocal_TranslatedReading($hash, $reading, $value), @rest);
 }
 
 sub HomeConnectLocal_RebuildTranslatedReadings {
     my ($hash) = @_;
     return if !$hash;
 
-    # Remove generated language readings first, so switching DE/EN/off is clean.
+    # Remove language-suffixed readings created by older module versions.
     for my $r (keys %{ $hash->{READINGS} // {} }) {
         readingsDelete($hash, $r) if $r =~ /_(?:DE|EN)$/;
     }
@@ -7976,13 +8037,12 @@ sub HomeConnectLocal_RebuildTranslatedReadings {
     return if $mode ne 'DE' && $mode ne 'EN';
 
     for my $r (sort keys %{ $hash->{READINGS} // {} }) {
-        next if $r =~ /_(?:DE|EN)$/;
         next if HomeConnectLocal_RawReadingHidden($hash, $r);
+        next if HomeConnectLocal_ReadingExcluded($hash, $r);
         my $v = ReadingsVal($hash->{NAME}, $r, undef);
         next if !defined($v);
-        my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $r, $v);
-        next if !defined($tr) || HomeConnectLocal_ReadingExcluded($hash, $tr);
-        readingsSingleUpdate($hash, $tr, $tv, 0);
+        my $tv = HomeConnectLocal_TranslatedReading($hash, $r, $v);
+        readingsSingleUpdate($hash, $r, $tv, 0) if "$tv" ne "$v";
     }
 }
 
@@ -8029,6 +8089,10 @@ sub HomeConnectLocal_Attr {
     return
         if !$hash;
 
+
+    if ($attr eq "proxyLog") {
+        return undef;
+    }
 
     if ($attr eq "showRawReadings") {
         # Default is 0. Switching back to 0 removes already existing raw JSON
@@ -8187,8 +8251,9 @@ sub HomeConnectLocal_Attr {
     <li><code>disable 0|1</code> &ndash; disable/enable communication.</li>
     <li><code>encryptionKey &lt;key&gt;</code> &ndash; appliance pairing/encryption key. Treat as confidential.</li>
     <li><code>connectionType TLS|AES</code> &ndash; local protocol connection type.</li>
+    <li><code>proxyLog normal|quiet</code> &ndash; control stderr of external socat/openssl TLS proxy processes (default: normal). With quiet, stderr is redirected to /dev/null on the next proxy start; AES is unaffected. Reconnect the device after changing this attribute. The TCP/TLS channel-active message is logged at level 3.</li>
     <li><code>iv &lt;value&gt;</code> &ndash; initialization-vector configuration where required by the selected connection type.</li>
-    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer</code> &ndash; appliance class used for mapping selection and display logic.</li>
+    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer|fridgefreezer</code> &ndash; appliance class used for mapping selection and display logic.</li>
     <li><code>mappingDir &lt;directory&gt;</code> &ndash; directory containing XML mapping files. Default: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
     <li><code>mappingPrefix &lt;prefix&gt;</code> &ndash; explicitly select a mapping file pair by prefix.</li>
     <li><code>excludeReadings &lt;patterns&gt;</code> &ndash; hide/delete unwanted readings. Wildcards <code>*</code> and <code>?</code> are supported.</li>
@@ -8271,8 +8336,9 @@ sub HomeConnectLocal_Attr {
     <li><code>disable 0|1</code> &ndash; Kommunikation deaktivieren/aktivieren.</li>
     <li><code>encryptionKey &lt;Schl&uuml;ssel&gt;</code> &ndash; Pairing-/Verschl&uuml;sselungsschl&uuml;ssel des Hausger&auml;ts. Vertraulich behandeln.</li>
     <li><code>connectionType TLS|AES</code> &ndash; verwendete lokale Protokollverbindung.</li>
+    <li><code>proxyLog normal|quiet</code> &ndash; steuert die Standardfehlerausgabe der externen TLS-Programme socat/openssl (Standard: normal). Bei quiet wird stderr beim n&auml;chsten Proxy-Start nach /dev/null umgeleitet; AES bleibt unber&uuml;hrt. Nach einer Attribut&auml;nderung das Ger&auml;t trennen und neu verbinden. Die Meldung &bdquo;TCP/TLS Kanal aktiv&ldquo; wird mit Log-Level 3 ausgegeben.</li>
     <li><code>iv &lt;Wert&gt;</code> &ndash; Initialisierungsvektor, sofern f&uuml;r die gew&auml;hlte Verbindungsart erforderlich.</li>
-    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer</code> &ndash; Ger&auml;teklasse f&uuml;r Mappingauswahl und Darstellungslogik.</li>
+    <li><code>deviceType dishwasher|hob|oven|washer|washerdryer|fridgefreezer</code> &ndash; Ger&auml;teklasse f&uuml;r Mappingauswahl und Darstellungslogik.</li>
     <li><code>mappingDir &lt;Verzeichnis&gt;</code> &ndash; Verzeichnis der XML-Mappingdateien. Standard: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
     <li><code>mappingPrefix &lt;Pr&auml;fix&gt;</code> &ndash; ein bestimmtes Mapping-Dateipaar anhand seines Pr&auml;fixes ausw&auml;hlen.</li>
     <li><code>excludeReadings &lt;Muster&gt;</code> &ndash; nicht ben&ouml;tigte Readings ausblenden/l&ouml;schen. Wildcards <code>*</code> und <code>?</code> werden unterst&uuml;tzt.</li>
