@@ -83,6 +83,9 @@
 #            extend fridge/freezer status value dictionary; SET/protocol unchanged
 #  1.60-4    AES initialization: set waiting states before sending requests
 #            to avoid overwriting a fast connected RESPONSE
+#  1.70      Declare FHEM global %defs under strict vars (FwDetail/Attr)
+#  1.70      Translation compatibility update: preserve original reading values
+#            and generate/update separate *_DE / *_EN companion readings
 #  1.70      Optional proxyLog normal|quiet for TLS socat/openssl stderr;
 #            TCP/TLS channel-active message moved to verbose level 3
 
@@ -98,6 +101,9 @@ package main;
 
 use strict;
 use warnings;
+
+# FHEM global device registry (required for strict-safe access to %defs).
+our %defs;
 use JSON::PP;
 use IO::Socket::INET;
 use IO::Socket::IP;
@@ -105,8 +111,6 @@ use MIME::Base64;
 use Digest::SHA qw(hmac_sha256 sha256_hex);
 use Crypt::Mode::CBC;
 use Encode qw(decode FB_CROAK);
-
-our %defs;
 
 # Private per-device protocol state. Kept outside the FHEM device hash so
 # cryptographic session material is not exposed as FHEMWEB Internals.
@@ -7984,21 +7988,23 @@ sub HomeConnectLocal_ReadingExcluded {
 }
 
 
-# Translate only the value, never the reading name. The raw protocol
-# and SET command tokens are not changed by this presentation step.
+# Preserve original readings; add translated companion readings (*_DE / *_EN).
+# Translation is display-only and never alters SET/protocol values.
 sub HomeConnectLocal_TranslatedReading {
     my ($hash, $reading, $value) = @_;
-    return $value if !$hash || !defined($reading) || !defined($value);
-    return $value if $reading =~ /_(?:DE|EN)$/;
+    return if !$hash || !defined($reading) || !defined($value);
+    return if $reading =~ /_(?:DE|EN)$/;
 
     my $mode = uc(AttrVal($hash->{NAME}, 'translation', 'off') // 'off');
-    return $value if $mode ne 'DE' && $mode ne 'EN';
-    return $value if !HomeConnectLocal_LoadTranslation($hash);
-    return $value if !defined(&HomeConnectLocal_TranslateReadingValue);
+    return if $mode ne 'DE' && $mode ne 'EN';
+    return if !HomeConnectLocal_LoadTranslation($hash);
+    return if !defined(&HomeConnectLocal_TranslateReadingValue);
 
     my $dtype = lc(AttrVal($hash->{NAME}, 'deviceType', ''));
     my $translated = HomeConnectLocal_TranslateReadingValue($mode, $dtype, $reading, $value);
-    return defined($translated) && $translated ne '' ? $translated : $value;
+    return if !defined($translated) || $translated eq '' || "$translated" eq "$value";
+
+    return ($reading . '_' . $mode, $translated);
 }
 
 sub HomeConnectLocal_ReadingsSingleUpdate {
@@ -8013,24 +8019,33 @@ sub HomeConnectLocal_ReadingsSingleUpdate {
     return if HomeConnectLocal_RawReadingHidden($hash, $reading);
     return if HomeConnectLocal_ReadingExcluded($hash, $reading);
 
-    return readingsSingleUpdate($hash, $reading,
-        HomeConnectLocal_TranslatedReading($hash, $reading, $value), $trigger);
+    my $ret = readingsSingleUpdate($hash, $reading, $value, $trigger);
+    my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
+    if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
+        readingsSingleUpdate($hash, $tr, $tv, $trigger);
+    }
+    return $ret;
 }
 
 sub HomeConnectLocal_ReadingsBulkUpdate {
     my ($hash, $reading, $value, @rest) = @_;
+
     return if HomeConnectLocal_RawReadingHidden($hash, $reading);
     return if HomeConnectLocal_ReadingExcluded($hash, $reading);
 
-    return readingsBulkUpdate($hash, $reading,
-        HomeConnectLocal_TranslatedReading($hash, $reading, $value), @rest);
+    my $ret = readingsBulkUpdate($hash, $reading, $value, @rest);
+    my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
+    if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
+        readingsBulkUpdate($hash, $tr, $tv, @rest);
+    }
+    return $ret;
 }
 
 sub HomeConnectLocal_RebuildTranslatedReadings {
     my ($hash) = @_;
     return if !$hash;
 
-    # Remove language-suffixed readings created by older module versions.
+    # Remove generated language readings first, so switching DE/EN/off is clean.
     for my $r (keys %{ $hash->{READINGS} // {} }) {
         readingsDelete($hash, $r) if $r =~ /_(?:DE|EN)$/;
     }
@@ -8039,12 +8054,13 @@ sub HomeConnectLocal_RebuildTranslatedReadings {
     return if $mode ne 'DE' && $mode ne 'EN';
 
     for my $r (sort keys %{ $hash->{READINGS} // {} }) {
+        next if $r =~ /_(?:DE|EN)$/;
         next if HomeConnectLocal_RawReadingHidden($hash, $r);
-        next if HomeConnectLocal_ReadingExcluded($hash, $r);
         my $v = ReadingsVal($hash->{NAME}, $r, undef);
         next if !defined($v);
-        my $tv = HomeConnectLocal_TranslatedReading($hash, $r, $v);
-        readingsSingleUpdate($hash, $r, $tv, 0) if "$tv" ne "$v";
+        my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $r, $v);
+        next if !defined($tr) || HomeConnectLocal_ReadingExcluded($hash, $tr);
+        readingsSingleUpdate($hash, $tr, $tv, 0);
     }
 }
 
@@ -8261,7 +8277,7 @@ sub HomeConnectLocal_Attr {
     <li><code>excludeReadings &lt;patterns&gt;</code> &ndash; hide/delete unwanted readings. Wildcards <code>*</code> and <code>?</code> are supported.</li>
     <li><code>showRawReadings 0|1</code> &ndash; show raw protocol JSON readings. Default is 0; enable only for diagnostics.</li>
     <li><code>excludeSets &lt;patterns&gt;</code> &ndash; hide SET commands from the generated FHEMWEB SetList. Wildcards are supported.</li>
-    <li><code>translation off|DE|EN</code> &ndash; optional translated display/readings without changing protocol values.</li>
+    <li><code>translation off|DE|EN</code> &ndash; optional translated companion readings (*_DE / *_EN); original readings and protocol values remain unchanged.</li>
     <li><code>programPopup on|off</code> &ndash; enable the FHEMWEB program preparation popup.</li>
   </ul>
 
@@ -8346,7 +8362,7 @@ sub HomeConnectLocal_Attr {
     <li><code>excludeReadings &lt;Muster&gt;</code> &ndash; nicht ben&ouml;tigte Readings ausblenden/l&ouml;schen. Wildcards <code>*</code> und <code>?</code> werden unterst&uuml;tzt.</li>
     <li><code>showRawReadings 0|1</code> &ndash; rohe Protokoll-JSON-Readings anzeigen. Standard ist 0; nur zur Diagnose aktivieren.</li>
     <li><code>excludeSets &lt;Muster&gt;</code> &ndash; SET-Befehle aus der dynamischen FHEMWEB-SetList ausblenden. Wildcards werden unterst&uuml;tzt.</li>
-    <li><code>translation off|DE|EN</code> &ndash; optionale Anzeige/&Uuml;bersetzung, ohne die internen Protokollwerte zu ver&auml;ndern.</li>
+    <li><code>translation off|DE|EN</code> &ndash; optionale zus&auml;tzliche &Uuml;bersetzungs-Readings (*_DE / *_EN); Original-Readings und Protokollwerte bleiben unver&auml;ndert.</li>
     <li><code>programPopup on|off</code> &ndash; Dialog &bdquo;Programm vorbereiten&ldquo; in FHEMWEB aktivieren.</li>
   </ul>
 
