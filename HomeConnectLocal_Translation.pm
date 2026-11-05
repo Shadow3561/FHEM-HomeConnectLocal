@@ -281,15 +281,7 @@ my %HCL_DE_READING_VALUE = (
     RemoteControlStartAllowed => { true => 'zugelassen', false => 'nicht zugelassen', 1 => 'zugelassen', 0 => 'nicht zugelassen' },
     RemoteControlActive => { true => 'aktiv', false => 'inaktiv', 1 => 'aktiv', 0 => 'inaktiv' },
     LocalControlActive => { true => 'aktiv', false => 'inaktiv', 1 => 'aktiv', 0 => 'inaktiv' },
-    DoorState => { Open => 'offen', Closed => 'geschlossen', Locked => 'verriegelt', Ajar => 'angelehnt' },
-    Freezer => { Open => 'offen', Closed => 'geschlossen' },
-    Refrigerator => { Open => 'offen', Closed => 'geschlossen' },
-    EcoMode => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
-    FreshMode => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
-    VacationMode => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
-    SabbathMode => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
-    'Freezer.SuperMode' => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
-    'Refrigerator.SuperMode' => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus' },
+    DoorState => { Open => 'offen', Closed => 'geschlossen', Locked => 'verriegelt' },
     OperationState => { Ready => 'Bereit', Inactive => 'Ruhezustand', Run => 'Läuft', Finished => 'Fertig', Pause => 'Pause', Aborting => 'Abbruch', Error => 'Fehlerzustand' },
     PowerState => { On => 'An', Off => 'Aus', PowerOn => 'An', PowerOff => 'Aus', PowerStandby => 'Standby' },
     ChildLock => { On => 'An', Off => 'Aus', true => 'An', false => 'Aus', 1 => 'An', 0 => 'Aus' },
@@ -354,8 +346,6 @@ sub HomeConnectLocal_TranslateReadingValue {
     $device_type = lc($device_type // '');
 
     my $specific = $language eq 'DE' ? $HCL_DE_READING_VALUE{$reading} : $HCL_EN_READING_VALUE{$reading};
-    # Door readings named Freezer/Refrigerator are fridge/freezer-specific.
-    $specific = undef if $reading =~ /^(?:Freezer|Refrigerator)$/ && $device_type ne 'fridgefreezer';
     if (ref($specific) eq 'HASH' && exists $specific->{$value}) {
         return $specific->{$value};
     }
