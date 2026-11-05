@@ -14,8 +14,8 @@
 #  Device capabilities, programs, settings and options are loaded dynamically
 #  from external Home Connect DeviceDescription and FeatureMapping XML files.
 #
-#  Version 1.70, 01.11.2026
-#  $Id: 70_HomeConnectLocal.pm 1.70 2026-11-01 $
+#  Version 1.71, 02.11.2026
+#  $Id: 70_HomeConnectLocal.pm 1.71 2026-11-02 $
 #
 ########################################################################################
 #
@@ -88,6 +88,12 @@
 #            and generate/update separate *_DE / *_EN companion readings
 #  1.70      Optional proxyLog normal|quiet for TLS socat/openssl stderr;
 #            TCP/TLS channel-active message moved to verbose level 3
+#  1.71      Private openssl socketpair replaces the network-facing TLS proxy;
+#            own child lifecycle, nonblocking send queue with timeout, deferred
+#            mapping attributes and cleanup of stale translated readings
+#  1.71      Close inherited child descriptors; protect child signalling against
+#            SIGCHLD reaping; use a five-second no-progress write timeout and
+#            defer new heartbeat PINGs until queued output has drained
 
 #
 ########################################################################################
@@ -111,13 +117,15 @@ use MIME::Base64;
 use Digest::SHA qw(hmac_sha256 sha256_hex);
 use Crypt::Mode::CBC;
 use Encode qw(decode FB_CROAK);
+use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
+use POSIX qw(WNOHANG SIG_BLOCK SIG_SETMASK SIGCHLD);
 
 # Private per-device protocol state. Kept outside the FHEM device hash so
 # cryptographic session material is not exposed as FHEMWEB Internals.
 my %HomeConnectLocal_Private;
 
 # Central module version. Also exposed in each device as MODULE_VERSION.
-my $HomeConnectLocal_VERSION = '1.70';
+my $HomeConnectLocal_VERSION = '1.71';
 
 
 ##############################################
@@ -3002,60 +3010,8 @@ sub HomeConnectLocal_OpenWebSocket {
         . $crlf;
 
 
-    my $len =
-        length($req);
-
-    my $offset =
-        0;
-
-
-    while ($offset < $len) {
-
-        my $written =
-            syswrite(
-                $socket,
-                $req,
-                $len - $offset,
-                $offset
-            );
-
-
-        if (!defined($written)) {
-
-            Log3 $name, 3,
-                "HomeConnectLocal ($name) - "
-                . "WebSocket Handshake konnte "
-                . "nicht gesendet werden: $!";
-
-            return 0;
-        }
-
-
-        if ($written == 0) {
-
-            Log3 $name, 3,
-                "HomeConnectLocal ($name) - "
-                . "WebSocket Handshake: "
-                . "Socket beim Schreiben geschlossen.";
-
-            return 0;
-        }
-
-
-        $offset +=
-            $written;
-    }
-
-
-    Log3 $name, 5,
-        "HomeConnectLocal ($name) - "
-        . "WebSocket Handshake: "
-        . "$offset/$len Bytes gesendet.";
-
-
-    $hash->{WSHandshake} =
-        1;
-
+    $hash->{WSHandshake} = 1;
+    return 0 if !HomeConnectLocal_QueueWrite($hash, $req);
 
     HomeConnectLocal_ReadingsSingleUpdate(
         $hash,
@@ -3256,50 +3212,18 @@ sub HomeConnectLocal_Connect {
             . "TCP/AES Kanal zu "
             . "$host:80 verbunden.";
 
+        $s->blocking(0);
+        $hash->{FD} = fileno($s);
+        $hash->{CD} = $s;
+        $main::selectlist{$name} = $hash;
+
         my $ws_host = $host;
         $ws_host =~ s/%[^%]+$// if $ws_host =~ /:/;
         $ws_host = "[$ws_host]" if $ws_host =~ /:/ && $ws_host !~ /^\[/;
-        my $ok =
-            HomeConnectLocal_OpenWebSocket(
-                $hash,
-                $s,
-                "$ws_host:80"
-            );
-
-        if (!$ok) {
-
-            close($s);
-
-            delete
-                $hash->{WSHandshake};
-
-            HomeConnectLocal_ReadingsSingleUpdate(
-                $hash,
-                "state",
-                "closed",
-                1
-            );
-
-            InternalTimer(
-                time() + 10,
-                "HomeConnectLocal_Connect",
-                $hash,
-                0
-            );
-
+        if (!HomeConnectLocal_OpenWebSocket($hash, $s, "$ws_host:80")) {
+            HomeConnectLocal_Close($hash) if $hash->{CD};
             return;
         }
-
-        $s->blocking(0);
-
-        $hash->{FD} =
-            fileno($s);
-
-        $hash->{CD} =
-            $s;
-
-        $main::selectlist{$name} =
-            $hash;
 
         Log3 $name, 5,
             "HomeConnectLocal ($name) - "
@@ -3309,136 +3233,119 @@ sub HomeConnectLocal_Connect {
     }
 
 
-    #
-    # ==========================================
-    # TLS / PSK
-    # ==========================================
-    #
-    # FUNKTIONIERENDEN TLS-PFAD NICHT VERÄNDERN.
-    #
-
-    my $hex =
-        unpack(
-            "H*",
-            $psk
-        );
-
-    # Keep the established port for IPv4 devices. For DNS names,
-    # derive a stable local port without interpreting a hostname as a number.
-    # This is only the LOCAL socat listener port, not the appliance port.
-    my $lp;
-    if ($host =~ /\A(?:\d{1,3}\.){3}(\d{1,3})\z/ && $1 <= 255) {
-        $lp = 10000 + $1;
-    } else {
-        # Stable across restarts; unlike Perl's hash(), SHA is deterministic.
-        # The device name distinguishes FHEM instances using the same FQDN.
-        $lp = 20000 + (hex(substr(sha256_hex($name), 0, 8)) % 40000);
-    }
-
-    $hash->{LocalPort} =
-        $lp;
-
-    Log3 $name, 5,
-        "HomeConnectLocal ($name) - "
-        . "Starte TLS-PSK Proxy "
-        . "auf Port $lp";
-
-    system(
-        "pkill -f 'socat.*LISTEN:$lp'"
-    );
-
-    # OpenSSL expects bracketed IPv6 literals in host:port notation.
-    # DNS names (including AAAA records) and IPv4 remain unchanged.
+    # TLS/PSK: use a private Unix socketpair to openssl. No network listener,
+    # port allocation, socat or shell is needed; TLS options remain unchanged.
+    my $hex = unpack('H*', $psk);
     my $tls_host = $host;
-    if ($tls_host =~ /:/ && $tls_host !~ /^\[.*\]$/) {
-        $tls_host = "[$tls_host]";
+    $tls_host = "[$tls_host]" if $tls_host =~ /:/ && $tls_host !~ /^\[.*\]$/;
+    if (!HomeConnectLocal_StartTLS($hash, "$tls_host:443", $hex)) {
+        InternalTimer(time() + 10, 'HomeConnectLocal_Connect', $hash, 0);
+        return;
     }
-    # socat EXEC parses ':' as an address separator, including inside
-    # bracketed IPv6 literals. Escape EVERY colon for socat, not only :443.
-    # The surrounding shell single quotes preserve these backslashes.
-    $tls_host =~ s/:/\\:/g if $tls_host =~ /:/;
-
-    my $proxy_log = AttrVal($name, "proxyLog", "normal");
-    my $proxy_stderr = $proxy_log eq "quiet" ? " 2>/dev/null" : "";
-
-    my $cmd =
-          "socat "
-        . "TCP-LISTEN:$lp,reuseaddr,fork "
-        . "EXEC:'openssl s_client "
-        . "-connect $tls_host\\:443 "
-        . "-tls1_2 "
-        . "-psk $hex "
-        . "-noservername "
-        . "-cipher ECDHE-PSK-CHACHA20-POLY1305 "
-        . "-quiet "
-        . "-ign_eof',nofork"
-        . $proxy_stderr
-        . " &";
-
-    system($cmd);
-
-    InternalTimer(
-        time() + 0.5,
-        sub {
-
-            my $s =
-                IO::Socket::INET->new(
-                    PeerAddr => '127.0.0.1',
-                    PeerPort => $lp,
-                    Proto    => 'tcp',
-                    Blocking => 0
-                );
-
-            if (!$s) {
-
-                Log3 $name, 3,
-                    "HomeConnectLocal ($name) - "
-                    . "Verbindung zum TLS-Proxy "
-                    . "auf Port $lp fehlgeschlagen.";
-
-                InternalTimer(
-                    time() + 10,
-                    "HomeConnectLocal_Connect",
-                    $hash,
-                    0
-                );
-
-                return;
-            }
-
-            $hash->{FD} =
-                fileno($s);
-
-            $hash->{CD} =
-                $s;
-
-            $main::selectlist{$name} =
-                $hash;
-
-            Log3 $name, 3,
-                "HomeConnectLocal ($name) - "
-                . "TCP/TLS Kanal aktiv.";
-
-            my $ok =
-                HomeConnectLocal_OpenWebSocket(
-                    $hash,
-                    $s,
-                    $host
-                );
-
-            if ($ok) {
-
-                Log3 $name, 5,
-                    "HomeConnectLocal ($name) - "
-                    . "WebSocket Handshake gesendet.";
-            }
-
-        },
-        $hash
-    );
-
+    my $ws_host = $host;
+    $ws_host =~ s/%[^%]+$// if $ws_host =~ /:/;
+    $ws_host = "[$ws_host]" if $ws_host =~ /:/ && $ws_host !~ /^\[/;
+    if (!HomeConnectLocal_OpenWebSocket($hash, $hash->{CD}, $ws_host)) {
+        HomeConnectLocal_Close($hash) if $hash->{CD};
+    }
     return;
 }
+
+sub HomeConnectLocal_StartTLS {
+    my ($hash, $endpoint, $hex) = @_;
+    my $name = $hash->{NAME};
+    my $quiet = AttrVal($name, 'proxyLog', 'normal') eq 'quiet';
+    my ($parent, $child);
+    if (!socketpair($parent, $child, AF_UNIX, SOCK_STREAM, PF_UNSPEC)) {
+        Log3 $name, 3, "HomeConnectLocal ($name) - TLS socketpair: $!";
+        return;
+    }
+    my $pid = fork();
+    if (!defined($pid)) {
+        Log3 $name, 3, "HomeConnectLocal ($name) - TLS fork: $!";
+        close($parent);
+        close($child);
+        return;
+    }
+    if ($pid == 0) {
+        $SIG{TERM} = 'DEFAULT';
+        $SIG{INT} = 'DEFAULT';
+        close($parent);
+        open(STDIN, '<&', $child) or POSIX::_exit(126);
+        open(STDOUT, '>&', $child) or POSIX::_exit(126);
+        close($child);
+        if ($quiet) {
+            open(STDERR, '>', '/dev/null') or POSIX::_exit(126);
+        }
+        HomeConnectLocal_CloseInheritedFDs() or POSIX::_exit(126);
+        exec('openssl', 's_client', '-connect', $endpoint,
+            '-tls1_2', '-psk', $hex, '-noservername',
+            '-cipher', 'ECDHE-PSK-CHACHA20-POLY1305', '-quiet', '-ign_eof')
+            or POSIX::_exit(127);
+    }
+    close($child);
+    $parent->blocking(0);
+    $HomeConnectLocal_Private{$name}{TLS_PID} = $pid;
+    $hash->{CD} = $parent;
+    $hash->{FD} = fileno($parent);
+    $main::selectlist{$name} = $hash;
+    delete $hash->{LocalPort};
+    return 1;
+}
+
+sub HomeConnectLocal_CloseInheritedFDs {
+    # Do not depend on Perl's $^F or on every FHEM extension setting CLOEXEC.
+    # Enumerate first, then close the directory before closing other handles.
+    for my $path ('/proc/self/fd', '/dev/fd') {
+        next if !opendir(my $directory, $path);
+        my @fds = grep { /^\d+$/ && $_ > 2 } readdir($directory);
+        closedir($directory);
+        POSIX::close($_) for @fds;
+        return 1;
+    }
+    my $limit = eval { POSIX::sysconf(POSIX::_SC_OPEN_MAX()) };
+    return if !defined($limit) || $limit < 3;
+    for (my $fd = 3; $fd < $limit; $fd++) {
+        POSIX::close($fd);
+    }
+    return 1;
+}
+
+sub HomeConnectLocal_SignalTLSChild {
+    my ($pid, $signal) = @_;
+    # FHEM's SIGCHLD handler must not reap a child between waitpid and kill:
+    # after reaping, its PID could be reused by an unrelated process.
+    my $blocked = POSIX::SigSet->new(SIGCHLD);
+    my $previous = POSIX::SigSet->new();
+    return 2 if !defined(POSIX::sigprocmask(SIG_BLOCK, $blocked, $previous));
+    my $result;
+    do {
+        $result = waitpid($pid, WNOHANG);
+    } while ($result == -1 && $!{EINTR});
+    my $pending = $result == 0 ? 1 : ($result == -1 && !$!{ECHILD} ? 2 : 0);
+    kill($signal, $pid) if $result == 0 && defined($signal);
+    POSIX::sigprocmask(SIG_SETMASK, $previous);
+    return $pending;
+}
+
+sub HomeConnectLocal_StopTLS {
+    my ($hash) = @_;
+    my $pid = delete $HomeConnectLocal_Private{$hash->{NAME}}{TLS_PID};
+    return if !$pid;
+    return if !HomeConnectLocal_SignalTLSChild($pid, 'TERM');
+    InternalTimer(gettimeofday() + 0.1, 'HomeConnectLocal_ReapTLS', { pid => $pid }, 0);
+}
+
+sub HomeConnectLocal_ReapTLS {
+    my ($child) = @_;
+    my $pid = $child->{pid};
+    my $signal = $child->{killed} ? undef : 'KILL';
+    my $pending = HomeConnectLocal_SignalTLSChild($pid, $signal);
+    return if !$pending;
+    $child->{killed} = 1 if $pending == 1;
+    InternalTimer(gettimeofday() + 0.1, 'HomeConnectLocal_ReapTLS', $child, 0);
+}
+
 ##############################################
 # WebSocket Frame
 ##############################################
@@ -3631,77 +3538,67 @@ sub HomeConnectLocal_SendRaw {
         );
 
 
-    my $len =
-        length($frame);
+    return HomeConnectLocal_QueueWrite($hash, $frame);
+}
 
-    my $off =
-        0;
-
-
-    my $was_blocking =
-        $s->blocking();
-
-
-    $s->blocking(1);
-
-
-    while ($off < $len) {
-
-        my $written =
-            syswrite(
-                $s,
-                $frame,
-                $len - $off,
-                $off
-            );
-
-
-        if (!defined($written)) {
-
-            Log3 $n, 3,
-                "HomeConnectLocal ($n) - "
-                . "SEND fehlgeschlagen "
-                . "bei $off/$len Bytes: $!";
-
-            $s->blocking(
-                $was_blocking
-            );
-
-            return undef;
-        }
-
-
-        if ($written == 0) {
-
-            Log3 $n, 3,
-                "HomeConnectLocal ($n) - "
-                . "SEND Socket geschlossen "
-                . "bei $off/$len Bytes.";
-
-            $s->blocking(
-                $was_blocking
-            );
-
-            return undef;
-        }
-
-
-        $off +=
-            $written;
+# All bytes, including control frames, share one queue so short writes cannot
+# interleave frames. Success means accepted for delivery. On error, close the
+# session: an AES stream cannot safely retry a partly sent message.
+sub HomeConnectLocal_QueueWrite {
+    my ($hash, $bytes) = @_;
+    return if !$hash->{CD};
+    my $pending = ($HomeConnectLocal_Private{$hash->{NAME}}{SEND} ||= {
+        buffer => '', deadline => gettimeofday() + 5,
+    });
+    if (length($pending->{buffer}) + length($bytes) > 1048576) {
+        Log3 $hash->{NAME}, 3, "HomeConnectLocal ($hash->{NAME}) - Sendepuffer voll; reconnect.";
+        HomeConnectLocal_Close($hash);
+        return;
     }
+    $pending->{buffer} .= $bytes;
+    return HomeConnectLocal_FlushWrite($hash);
+}
 
-
-    $s->blocking(
-        $was_blocking
-    );
-
-
-    Log3 $n, 5,
-        "HomeConnectLocal ($n) - "
-        . "SEND vollständig: "
-        . "$off/$len Bytes";
-
-
+sub HomeConnectLocal_FlushWrite {
+    my ($hash) = @_;
+    RemoveInternalTimer($hash, 'HomeConnectLocal_FlushWrite');
+    my $pending = $HomeConnectLocal_Private{$hash->{NAME}}{SEND};
+    my $socket = $hash->{CD};
+    return if !$socket || !$pending;
+    $socket->blocking(0);
+    local $SIG{PIPE} = 'IGNORE';
+    my $budget = 65536;
+    while (length($pending->{buffer})) {
+        if (gettimeofday() >= $pending->{deadline}) {
+            Log3 $hash->{NAME}, 3, "HomeConnectLocal ($hash->{NAME}) - Sende-Timeout; reconnect.";
+            HomeConnectLocal_Close($hash);
+            return;
+        }
+        last if $budget <= 0;
+        my $size = length($pending->{buffer});
+        $size = $budget if $size > $budget;
+        my $written = syswrite($socket, $pending->{buffer}, $size);
+        if (!defined($written)) {
+            last if $!{EAGAIN} || $!{EWOULDBLOCK} || $!{EINTR};
+            Log3 $hash->{NAME}, 3, "HomeConnectLocal ($hash->{NAME}) - Socket Schreibfehler: $!";
+            HomeConnectLocal_Close($hash);
+            return;
+        }
+        if ($written == 0) {
+            HomeConnectLocal_Close($hash);
+            return;
+        }
+        substr($pending->{buffer}, 0, $written) = '';
+        # Five seconds without progress, rather than five seconds for the
+        # entire queue: slow but continuously draining peers remain connected.
+        $pending->{deadline} = gettimeofday() + 5;
+        $budget -= $written;
+    }
+    if (length($pending->{buffer})) {
+        InternalTimer(gettimeofday() + 0.05, 'HomeConnectLocal_FlushWrite', $hash, 0);
+    } else {
+        delete $HomeConnectLocal_Private{$hash->{NAME}}{SEND};
+    }
     return 1;
 }
 
@@ -3865,7 +3762,7 @@ sub HomeConnectLocal_SendProtocol {
         };
         Log3 $hash->{NAME}, 3, "HomeConnectLocal ($hash->{NAME}) - PROTO DIAG TX: "
             . "seq=$seq msgID=$m->{msgID} sid=$m->{sID} $act $res "
-            . "aesTX=" . ($pd->{AES_TX_COUNT} // '-') . " socket=OK";
+            . "aesTX=" . ($pd->{AES_TX_COUNT} // '-') . " transport=accepted";
         InternalTimer(time() + 8, 'HomeConnectLocal_ProtoDiagTimeout', $hash, 0);
     }
 
@@ -5647,6 +5544,13 @@ sub HomeConnectLocal_Heartbeat {
         return;
     }
 
+    # Start the PONG deadline only after earlier output has drained. Otherwise
+    # a slow queue could consume the deadline before its PING reaches the peer.
+    if ($HomeConnectLocal_Private{$name}{SEND}) {
+        InternalTimer($now + 1, 'HomeConnectLocal_Heartbeat', $hash, 0);
+        return;
+    }
+
     my $payload = HomeConnectLocal_RandomBytes(4);
     my $ping = HomeConnectLocal_WSFrame_Control(0x9, $payload);
 
@@ -5657,14 +5561,7 @@ sub HomeConnectLocal_Heartbeat {
         return;
     }
 
-    my $written = syswrite($s, $ping);
-    if (!defined($written) || $written != length($ping)) {
-        Log3 $name, 3,
-            "HomeConnectLocal ($name) - WebSocket PING konnte nicht vollständig gesendet werden"
-            . (defined($written) ? " ($written/" . length($ping) . " Bytes)." : ": $!");
-        HomeConnectLocal_Close($hash);
-        return;
-    }
+    return if !HomeConnectLocal_QueueWrite($hash, $ping);
 
     $hb->{pending} = 1;
     $hb->{payload} = $payload;
@@ -6145,17 +6042,11 @@ sub HomeConnectLocal_Read {
                 );
 
 
-            my $written =
-                defined($pong)
-                ? syswrite($s, $pong)
-                : undef;
-
-            if (!defined($pong) || !defined($written) || $written != length($pong)) {
-                Log3 $n, 3,
-                    "HomeConnectLocal ($n) - WebSocket PONG konnte nicht vollständig gesendet werden.";
+            if (!defined($pong)) {
                 HomeConnectLocal_Close($hash);
                 return;
             }
+            return if !HomeConnectLocal_QueueWrite($hash, $pong);
 
             Log3 $n, 5,
                 "HomeConnectLocal ($n) - WebSocket PING empfangen, PONG gesendet.";
@@ -6405,46 +6296,7 @@ sub HomeConnectLocal_Close {
         $hash->{NAME};
 
 
-    if (
-        $hash->{CD}
-    ) {
-
-        close(
-            $hash->{CD}
-        );
-
-        delete
-            $hash->{CD};
-    }
-
-
-    delete
-        $main::selectlist{$n};
-
-    delete
-        $hash->{FD};
-
-    delete
-        $hash->{WSHandshake};
-
-    delete
-        $hash->{WS_FRAGMENT_DATA};
-
-    delete
-        $hash->{WS_FRAGMENT_OPCODE};
-
-    delete
-        $HomeConnectLocal_Private{$n}{WS_HEARTBEAT};
-
-    RemoveInternalTimer(
-        $hash,
-        'HomeConnectLocal_Heartbeat'
-    );
-
-
-    $hash->{PARTIAL} =
-        "";
-
+    HomeConnectLocal_Undefine($hash);
 
     HomeConnectLocal_ReadingsSingleUpdate(
         $hash,
@@ -6472,6 +6324,8 @@ sub HomeConnectLocal_Close {
 
 sub HomeConnectLocal_Undefine {
     my ($hash) = @_;
+
+    HomeConnectLocal_StopTLS($hash);
 
 
     RemoveInternalTimer(
@@ -6582,7 +6436,7 @@ sub HomeConnectLocal_DiagPostEndpointsNext {
     my $ok = HomeConnectLocal_SendProtocol($hash, '/ro/descriptionChange', 1,
         'POST', { uid => 524, value => $value });
     Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 2/2 "
-        . ($ok ? 'socket write OK; wait for RESPONSE/ERROR or timeout' : 'send FAILED');
+        . ($ok ? 'transport accepted; wait for RESPONSE/ERROR or timeout' : 'send FAILED');
 }
 
 # Read-only diagnostic: check a known handshake endpoint after initialization.
@@ -6633,7 +6487,7 @@ sub HomeConnectLocal_Set {
             . "msgID=$mid sID=$sid AES_TX_before="
             . ($HomeConnectLocal_Private{$n}{AES_TX_COUNT} // '-');
         my $ok = HomeConnectLocal_SendRaw($hash, $json);
-        return 'GET RAW socket write failed' if !$ok;
+        return 'GET RAW transport enqueue failed' if !$ok;
         $hash->{TxMsgID} = $mid + 1;
         $HomeConnectLocal_Private{$n}{DIAG_GET} = {
             msgID => $mid, sent_at => time(), sid => $sid
@@ -6659,13 +6513,13 @@ sub HomeConnectLocal_Set {
             . "GET /ci/info msgID=$mid sID=$hash->{SessionID} "
             . "transport=" . ($hash->{ConnectionType} // 'TLS');
         my $ok = HomeConnectLocal_SendProtocol($hash, '/ci/info', 2, 'GET', undef);
-        return 'GET socket write failed' if !$ok;
+        return 'GET transport enqueue failed' if !$ok;
         $HomeConnectLocal_Private{$n}{DIAG_GET} = {
             msgID => $mid, sent_at => time(), sid => $hash->{SessionID}
         };
         InternalTimer(time() + 5, 'HomeConnectLocal_DiagGetTimeout', $hash, 0);
         Log3 $n, 3, "HomeConnectLocal ($n) - DIAG GET SENT: "
-            . "msgID=$mid (socket write only; waiting for protocol RESPONSE)";
+            . "msgID=$mid (accepted for delivery only; waiting for protocol RESPONSE)";
         return 'GET /ci/info sent; wait 5 seconds and inspect log';
     }
 
@@ -6689,7 +6543,7 @@ sub HomeConnectLocal_Set {
             sid => $hash->{SessionID}, value => ($a[2] eq 'on' ? 1 : 0)
         };
         InternalTimer(time() + 7, 'HomeConnectLocal_DiagPostEndpointsNext', $hash, 0);
-        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 1/2 socket write OK; "
+        Log3 $n, 3, "HomeConnectLocal ($n) - DIAG ENDPOINT 1/2 transport accepted; "
             . 'second experimental POST scheduled in 7 seconds';
         return 'Endpoint diagnostic started; wait 13 seconds and inspect verbose 5 log';
     }
@@ -6718,7 +6572,7 @@ sub HomeConnectLocal_Set {
             . " post=" . ($post ? 'sent' : 'FAILED')
             . " after=" . ($after ? 'sent' : 'FAILED')
             . " postMsgID=$mid_post nextMsgID=" . ($hash->{TxMsgID} // '?')
-            . ' (sent means socket write only, not appliance acceptance)';
+            . ' (sent means accepted for delivery only, not appliance acceptance)';
         return 'GET/POST/GET diagnostic sent; inspect FHEM log (verbose 5) and responses';
     }
 
@@ -8007,6 +7861,17 @@ sub HomeConnectLocal_TranslatedReading {
     return ($reading . '_' . $mode, $translated);
 }
 
+sub HomeConnectLocal_ClearStaleTranslation {
+    my ($hash, $reading, $current) = @_;
+    return if $reading =~ /_(?:DE|EN)$/;
+    for my $lang ('DE', 'EN') {
+        my $companion = $reading . '_' . $lang;
+        next if defined($current) && $current eq $companion
+            && !HomeConnectLocal_ReadingExcluded($hash, $companion);
+        readingsDelete($hash, $companion) if exists $hash->{READINGS}{$companion};
+    }
+}
+
 sub HomeConnectLocal_ReadingsSingleUpdate {
     my ($hash, $reading, $value, $trigger) = @_;
 
@@ -8021,6 +7886,7 @@ sub HomeConnectLocal_ReadingsSingleUpdate {
 
     my $ret = readingsSingleUpdate($hash, $reading, $value, $trigger);
     my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
+    HomeConnectLocal_ClearStaleTranslation($hash, $reading, $tr);
     if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
         readingsSingleUpdate($hash, $tr, $tv, $trigger);
     }
@@ -8035,6 +7901,7 @@ sub HomeConnectLocal_ReadingsBulkUpdate {
 
     my $ret = readingsBulkUpdate($hash, $reading, $value, @rest);
     my ($tr, $tv) = HomeConnectLocal_TranslatedReading($hash, $reading, $value);
+    HomeConnectLocal_ClearStaleTranslation($hash, $reading, $tr);
     if (defined($tr) && !HomeConnectLocal_ReadingExcluded($hash, $tr)) {
         readingsBulkUpdate($hash, $tr, $tv, @rest);
     }
@@ -8080,6 +7947,13 @@ sub HomeConnectLocal_ApplyExcludedReadings {
     return;
 }
 
+
+sub HomeConnectLocal_MappingAttrTimer {
+    my ($hash) = @_;
+    HomeConnectLocal_LoadMapping($hash);
+    HomeConnectLocal_RebuildTranslatedReadings($hash);
+    return;
+}
 
 sub HomeConnectLocal_TranslationAttrTimer {
     my ($hash) = @_;
@@ -8154,59 +8028,20 @@ sub HomeConnectLocal_Attr {
     }
 
 
-    if (
-        $attr =~
-        /^(?:encryptionKey|connectionType|iv|disable|mappingDir|mappingPrefix|deviceType)$/
-    ) {
+    if ($attr =~ /^(?:mappingDir|mappingPrefix|deviceType)$/) {
+        RemoveInternalTimer($hash, 'HomeConnectLocal_MappingAttrTimer');
+        InternalTimer(gettimeofday() + 0.1, 'HomeConnectLocal_MappingAttrTimer', $hash, 0);
+        return undef;
+    }
 
-        RemoveInternalTimer(
-            $hash
-        );
-
-
-        if (
-            $attr eq "disable" &&
-            defined($value) &&
-            $value
-        ) {
-
-            HomeConnectLocal_Undefine(
-                $hash
-            );
-
-
-            HomeConnectLocal_ReadingsSingleUpdate(
-                $hash,
-                "state",
-                "disabled",
-                1
-            );
-
-
+    if ($attr =~ /^(?:encryptionKey|connectionType|iv|disable)$/) {
+        if ($attr eq 'disable' && $cmd eq 'set' && ($value // 0)) {
+            HomeConnectLocal_Undefine($hash);
+            HomeConnectLocal_ReadingsSingleUpdate($hash, 'state', 'disabled', 1);
             return undef;
         }
-
-
-        if (
-            $attr =~
-            /^(?:mappingDir|mappingPrefix|deviceType)$/
-        ) {
-
-            HomeConnectLocal_LoadMapping(
-                $hash
-            );
-
-
-            return undef;
-        }
-
-
-        InternalTimer(
-            time() + 1,
-            "HomeConnectLocal_Connect",
-            $hash,
-            0
-        );
+        RemoveInternalTimer($hash, 'HomeConnectLocal_Connect');
+        InternalTimer(gettimeofday() + 1, 'HomeConnectLocal_Connect', $hash, 0);
     }
 
 
@@ -8269,7 +8104,7 @@ sub HomeConnectLocal_Attr {
     <li><code>disable 0|1</code> &ndash; disable/enable communication.</li>
     <li><code>encryptionKey &lt;key&gt;</code> &ndash; appliance pairing/encryption key. Treat as confidential.</li>
     <li><code>connectionType TLS|AES</code> &ndash; local protocol connection type.</li>
-    <li><code>proxyLog normal|quiet</code> &ndash; control stderr of external socat/openssl TLS proxy processes (default: normal). With quiet, stderr is redirected to /dev/null on the next proxy start; AES is unaffected. Reconnect the device after changing this attribute. The TCP/TLS channel-active message is logged at level 3.</li>
+    <li><code>proxyLog normal|quiet</code> &ndash; control stderr of the external openssl TLS process (default: normal). With quiet, stderr is redirected to /dev/null on the next TLS connection; AES is unaffected. Reconnect the device after changing this attribute. TLS uses a private local socket without a TCP listener.</li>
     <li><code>iv &lt;value&gt;</code> &ndash; initialization-vector configuration where required by the selected connection type.</li>
     <li><code>deviceType dishwasher|hob|oven|washer|washerdryer|fridgefreezer</code> &ndash; appliance class used for mapping selection and display logic.</li>
     <li><code>mappingDir &lt;directory&gt;</code> &ndash; directory containing XML mapping files. Default: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
@@ -8354,7 +8189,7 @@ sub HomeConnectLocal_Attr {
     <li><code>disable 0|1</code> &ndash; Kommunikation deaktivieren/aktivieren.</li>
     <li><code>encryptionKey &lt;Schl&uuml;ssel&gt;</code> &ndash; Pairing-/Verschl&uuml;sselungsschl&uuml;ssel des Hausger&auml;ts. Vertraulich behandeln.</li>
     <li><code>connectionType TLS|AES</code> &ndash; verwendete lokale Protokollverbindung.</li>
-    <li><code>proxyLog normal|quiet</code> &ndash; steuert die Standardfehlerausgabe der externen TLS-Programme socat/openssl (Standard: normal). Bei quiet wird stderr beim n&auml;chsten Proxy-Start nach /dev/null umgeleitet; AES bleibt unber&uuml;hrt. Nach einer Attribut&auml;nderung das Ger&auml;t trennen und neu verbinden. Die Meldung &bdquo;TCP/TLS Kanal aktiv&ldquo; wird mit Log-Level 3 ausgegeben.</li>
+    <li><code>proxyLog normal|quiet</code> &ndash; steuert die Standardfehlerausgabe des externen TLS-Programms openssl (Standard: normal). Bei quiet wird stderr bei der n&auml;chsten TLS-Verbindung nach /dev/null umgeleitet; AES bleibt unber&uuml;hrt. Nach einer Attribut&auml;nderung das Ger&auml;t trennen und neu verbinden. TLS verwendet einen privaten lokalen Socket ohne offenen TCP-Port.</li>
     <li><code>iv &lt;Wert&gt;</code> &ndash; Initialisierungsvektor, sofern f&uuml;r die gew&auml;hlte Verbindungsart erforderlich.</li>
     <li><code>deviceType dishwasher|hob|oven|washer|washerdryer|fridgefreezer</code> &ndash; Ger&auml;teklasse f&uuml;r Mappingauswahl und Darstellungslogik.</li>
     <li><code>mappingDir &lt;Verzeichnis&gt;</code> &ndash; Verzeichnis der XML-Mappingdateien. Standard: <code>/opt/fhem/FHEM/FHEM_HomeConnectLocal</code>.</li>
